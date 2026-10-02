@@ -1,0 +1,16 @@
+# The bench rig stays local; this repo is the production firmware and
+# everything it needs (docs, wiring, printed parts, laptop tools).
+desk-lab/
+
+# Machine-specific editor settings
+/.vscode/
+
+# Build output
+build/
+*.uf2
+*.elf
+*.bin
+*.map
+
+.DS_Store
+__pycache__/

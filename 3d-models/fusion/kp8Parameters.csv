@@ -1,0 +1,6 @@
+Name,Unit,Expression,Value,Comments,Favorite
+stand_length,mm,55 mm,55.00,,false
+stand_width,mm,13 mm,13.00,,false
+stand_height,mm,14 mm,14.00,,false
+stand_hole_d,mm,5 mm,5.00,,false
+stand_hole_distance,mm,42 mm,42.00,,false

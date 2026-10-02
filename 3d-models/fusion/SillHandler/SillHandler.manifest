@@ -1,0 +1,10 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "script",
+    "author": "alexche",
+    "description": {
+        "": "Recreates 3d-models/sill-handler.scad as a native Fusion assembly with a revolute joint on the shaft axis."
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}

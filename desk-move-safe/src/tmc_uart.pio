@@ -1,0 +1,96 @@
+;
+; tmc_uart — an 8N1 UART in PIO, for the TMC2209's PDN_UART pad.
+;
+; WHY PIO AND NOT A UART BLOCK. This chip has two, and the desk bus has both:
+; uart0 receives the board's height frames on GP1, uart1 receives the panel on
+; GP5 and transmits to the board on GP4. Neither can be shared — the desk runs
+; at 9600 baud and must not miss a frame, and the driver wants 115200. So the
+; third serial port is built out of PIO, which costs two state machines and
+; nothing else.
+;
+; HALF DUPLEX, AND WE HEAR OURSELVES. The driver has ONE pad for both
+; directions. Our TX reaches it through a 1 k resistor so that when the driver
+; answers, the two outputs fighting over the wire are limited to a few
+; milliamps; our RX sits on the pad directly. The consequence is that every
+; byte we send arrives straight back in our own RX FIFO before the reply does.
+; tmc2209.c reads those echoed bytes back and compares them — the echo failing
+; to return is the fastest possible evidence that the wire is not connected.
+;
+; Both programs are the pico-examples UARTs, 8 cycles per bit.
+;
+
+; ---- transmit -------------------------------------------------------------
+; The side-set pin is the TX line itself: it idles high on the pull (so a
+; stalled state machine leaves the line in its idle state, not in a break) and
+; goes low for the start bit while x is loaded.
+.program tmc_uart_tx
+.side_set 1 opt
+
+    pull            side 1 [7]      ; idle high; stall here between bytes
+    set x, 7        side 0 [7]      ; start bit, held one bit time
+bitloop:
+    out pins, 1                     ; shift out LSB first
+    jmp x-- bitloop        [6]
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void tmc_uart_tx_program_init(PIO pio, uint sm, uint offset,
+                                            uint pin, uint baud)
+{
+    // High BEFORE the pin becomes an output, so claiming it cannot emit a
+    // start bit the driver would try to decode.
+    pio_sm_set_pins_with_mask(pio, sm, 1u << pin, 1u << pin);
+    pio_sm_set_pindirs_with_mask(pio, sm, 1u << pin, 1u << pin);
+    pio_gpio_init(pio, pin);
+
+    pio_sm_config c = tmc_uart_tx_program_get_default_config(offset);
+    sm_config_set_out_shift(&c, true, false, 32);   // shift right, no autopull
+    sm_config_set_out_pins(&c, pin, 1);
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_clkdiv(&c, (float)clock_get_hz(clk_sys) / (8 * baud));
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+; ---- receive --------------------------------------------------------------
+; Waits for a start bit, samples eight bits at their centres, and checks the
+; stop bit. A framing error raises an IRQ and resynchronises on the next idle
+; line rather than pushing a corrupt byte.
+.program tmc_uart_rx
+
+start:
+    wait 0 pin 0                    ; start bit
+    set x, 7               [10]     ; skip to the centre of bit 0
+bitloop:
+    in pins, 1
+    jmp x-- bitloop        [6]
+    jmp pin good_stop               ; the stop bit must be high
+    irq 4 rel                       ; framing error
+    wait 1 pin 0                    ; wait for the line to go idle
+    jmp start
+good_stop:
+    push
+
+% c-sdk {
+static inline void tmc_uart_rx_program_init(PIO pio, uint sm, uint offset,
+                                            uint pin, uint baud)
+{
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    pio_gpio_init(pio, pin);
+    gpio_pull_up(pin);              // idle high while nothing drives the pad
+
+    pio_sm_config c = tmc_uart_rx_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_jmp_pin(&c, pin);
+    sm_config_set_in_shift(&c, true, false, 32);    // shift right, no autopush
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_clkdiv(&c, (float)clock_get_hz(clk_sys) / (8 * baud));
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
