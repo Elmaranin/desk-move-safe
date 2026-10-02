@@ -7,6 +7,7 @@
 #include "tmc2209.h"
 #include "encoder.h"
 #include "flap.h"
+#include "limits.h"
 #include "board_config.h"
 
 #include <stdio.h>
@@ -14,12 +15,6 @@
 // RAM only, and it has no initialiser on purpose: BSS is zeroed at reset, so
 // "working mode" is what a reset produces without anything having to run.
 static bool s_dev;
-
-// The bits limits.c uses in settings()->flap.flags, kept here so the boot check
-// can ask the question before the module that answers it exists. They come from
-// the bench rig's record, which settings_flap_t copies field for field.
-#define F_MIN   1u
-#define F_MAX   2u
 
 void mode_check(selfcheck_t *c)
 {
@@ -39,11 +34,28 @@ void mode_check(selfcheck_t *c)
     // which is harmless — nothing gates on it until FLAP_DRIVES_MOTOR.
     c->encoder = encoder_available() ? CHK_OK : CHK_FAIL;
 
-    // THE TRAVEL LIMITS. This one IS askable today: the record exists and the
-    // flags are zero until both ends have been stored. Step 3 fills them in;
-    // until then the answer is a truthful "not stored".
-    uint32_t f = settings()->flap.flags;
-    c->limits = ((f & (F_MIN | F_MAX)) == (F_MIN | F_MAX)) ? CHK_OK : CHK_FAIL;
+    // THE TRAVEL LIMITS. Both ends stored in the settings record.
+    c->limits = limits_calibrated() ? CHK_OK : CHK_FAIL;
+}
+
+// The desk gate. The flap is mounted where the desk travels, and a flap left
+// open is in the way: until the firmware can see the flap (encoder) and knows
+// where its ends are (limits), it cannot know the desk is safe to move. So it
+// refuses every move instead — panel included. A stuck desk is the price, and
+// it is the cheaper failure. The driver is not part of this: in standalone mode
+// it cannot be asked.
+bool mode_desk_may_move(void)
+{
+    return *mode_desk_blocked_by() == '\0';
+}
+
+const char *mode_desk_blocked_by(void)
+{
+    selfcheck_t c;
+    mode_check(&c);
+    if (c.encoder == CHK_FAIL) return "the MT6835 does not answer — the flap cannot be seen";
+    if (c.limits  == CHK_FAIL) return "the flap's min and max are not stored";
+    return "";
 }
 
 // What the flap has to be fit FOR depends on what it actually does.
@@ -57,6 +69,8 @@ bool mode_flap_may_run(void)
 {
     if (s_dev)
         return false;
+    if (!mode_desk_may_move())
+        return false;           // a takeover would only stall against the lock
     if (!FLAP_DRIVES_MOTOR)
         return true;
 
@@ -72,6 +86,8 @@ const char *mode_flap_blocked_by(void)
     if (s_dev)
         return "dev mode — the intercept is suspended while the motor is "
                "being driven by hand";
+    if (!mode_desk_may_move())
+        return mode_desk_blocked_by();
     if (!FLAP_DRIVES_MOTOR)
         return "";
 
@@ -107,11 +123,16 @@ void mode_report(void)
         printf("          the flap is still a dwell, so none of these gate it.\n"
                "          FLAP_DRIVES_MOTOR makes them requirements.\n");
 
+    const char *desk = mode_desk_blocked_by();
+    if (*desk)
+        printf("          DESK LOCKED: %s.\n"
+               "          Every move is refused, panel included (%lu so far).\n"
+               "          'init' calibrates the flap.\n",
+               desk, (unsigned long)flap_refused_moves());
+
     const char *why = mode_flap_blocked_by();
-    if (*why)
-        printf("          FLAP OFF: %s.\n"
-               "          The desk still works — the panel drives it exactly as\n"
-               "          it did before this board was fitted.\n", why);
+    if (*why && why != desk)        // the same reason is not worth saying twice
+        printf("          FLAP OFF: %s.\n", why);
 }
 
 bool mode_dev(void) { return s_dev; }
@@ -132,9 +153,10 @@ bool mode_set_dev(bool on)
         }
         s_dev = true;
         printf("\n*** DEV MODE ***\n"
-               "The motor commands are unlocked and NOTHING bounds them: there\n"
-               "are no travel limits in this build, so 'mot move' will drive the\n"
-               "flap into its end stop and keep pulsing. Nothing detects that.\n"
+               "The motor commands are unlocked. They go through the travel\n"
+               "limits: with min and max stored they cannot leave the range;\n"
+               "without them only 'mot jog' moves, one motor turn at most.\n"
+               "'lim free' lifts that for the session — then nothing does.\n"
                "\n"
                "The flap intercept is suspended while this lasts, so the desk is\n"
                "plain pass-through. 'dev stop', or any reset, returns to working\n"

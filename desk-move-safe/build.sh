@@ -19,6 +19,10 @@ case "$NINJA" in /*) PATH="$(dirname "$NINJA"):$PATH" ;; esac
 export PATH="$PICO_TOOLCHAIN_PATH/bin:$PATH"
 
 cd "$(dirname "$0")"
+
+# The console's help() and docs/commands.md must list the same commands.
+tools/check_commands.sh
+
 mkdir -p build
 cd build
 "$CMAKE" -G Ninja .. "$@"

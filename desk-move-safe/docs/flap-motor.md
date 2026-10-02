@@ -72,13 +72,16 @@ has any business happening because of a mistyped line on a desk in use. See
 mot                     what the motor is doing and how it is set
 mot on                  coils live
 mot rev 0.25            a quarter turn of the flap shaft
-mot speed 2000          slower, if it is skipping
 mot accel 2000          a deliberate ramp you can hear wind up
 mot accel 10000000      no ramp at all — usually a stall and a whine
 ```
 
 That last pair is the whole argument for the ramp engine: the driver turns one
 STEP edge into one microstep and has no idea any of this is happening.
+
+The cruise speed is a stored parameter rather than a `mot` command:
+`eeprom set mot_speed_sps 2000` slows it if the motor is skipping, and it stays
+that way across resets.
 
 If nothing moves: EN is active low, so GP8 has to go **low** to energise the
 coils, which `mot on` does. Then VM. Then the coil pairs — a NEMA 17 wired
@@ -201,12 +204,11 @@ If the count runs backwards relative to the motor, `enc dir 1` fixes it — on
 this part direction is a register bit, not a strapped pin. It is volatile until
 burnt to the sensor's EEPROM.
 
-### What it does not do yet
+### What depends on it
 
-Nothing gates on it. `mode_check()` now asks the sensor a real question and
-`dev` reports the answer, but `FLAP_DRIVES_MOTOR` is still 0, so a missing
-encoder does not stop the desk half working. That becomes a hard requirement in
-step 4 — see [operation.md](operation.md).
+Everything that moves. Without a valid frame from the MT6835 the desk is
+locked — every panel move refused — and the flap motor only jogs. See
+[commands.md](commands.md#what-it-needs-to-move).
 
 ## What this mode cannot tell you
 
@@ -260,10 +262,10 @@ attached, and `tmc scan` asks all four addresses.
 1. **Rotation** — done. The AVR446 ramp out of an alarm ISR, `mot` and `tmc`.
 2. **MT6835** — done. The 21-bit encoder on SPI1, `enc` and `enc watch`, and
    the boot self-check now asks it a real question.
-3. **Travel limits** — `limits.c` from the rig: min and max stored in flash,
-   backlash, and the creep onto a target under the encoder. Its values go in
-   `settings()->flap` and it marks the settings dirty like everything else —
-   `nvs` keeps exactly one record and `settings.c` is the only thing that may
-   write it.
+3. **Travel limits** — done. `limits.c` from the rig: min and max stored in flash,
+   backlash, and the creep onto a target under the encoder, calibrated with
+   `init`. Its values go in `settings()->lim` and it marks the settings dirty
+   like everything else — `nvs` keeps exactly one record and `settings.c` is
+   the only thing that may write it.
 4. **The desk** — `run_flap()` in `flap_task.c` is a two-second dwell today.
    That is the line that becomes a real move.

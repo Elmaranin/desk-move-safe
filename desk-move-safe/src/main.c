@@ -41,6 +41,8 @@
 #include "stepper.h"
 #include "tmc2209.h"
 #include "encoder.h"
+#include "limits.h"
+#include "led.h"
 
 TaskHandle_t g_task_bus, g_task_wire, g_task_flap, g_task_console, g_task_encoder;
 
@@ -81,6 +83,7 @@ int main(void)
     // say all of it again on demand.
     stepper_init();
     bool motor = tmc2209_init();
+    led_init();
 
     wait_for_serial(3000);
 
@@ -90,6 +93,7 @@ int main(void)
     printf("\n[boot] settings %s\n",
            settings_stored() ? "restored from flash"
                              : "from board_config.h (nothing stored)");
+    limits_init();             // the flap range lives in the same record
     printf("[boot] flap motor %s\n",
            motor ? "ready" : "NOT available — 'tmc' for what to check");
 
@@ -99,8 +103,9 @@ int main(void)
     // is nothing to run here either — the console's banner prints it a moment
     // from now, 'dev' repeats it, and flap_decide() consults it every frame.
     //
-    // Nothing blocks on the result. An unfit flap switches its own intercept
-    // off and the desk goes on being a desk. See mode.h.
+    // Nothing here blocks on the result. No encoder or no stored range locks
+    // the DESK — flap_decide() refuses every move — because a flap left open is
+    // in its path. See mode.h.
 
     // Bus highest: it is the only task with a hard deadline. A UART RX FIFO is
     // 32 bytes, which at 9600 baud is 33 ms of slack, and the console below it
@@ -121,6 +126,9 @@ int main(void)
     // sample that arrives late. It is below the bus task for the same reason
     // everything is — the bus is the only one with a hard deadline.
     xTaskCreate(encoder_task, "encoder", 1024, NULL, 3, &g_task_encoder);
+
+    // Lowest: it only blinks.
+    xTaskCreate(led_task,     "led",      256, NULL, 1, NULL);
 
     vTaskStartScheduler();
 

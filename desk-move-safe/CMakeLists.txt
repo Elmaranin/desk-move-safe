@@ -49,11 +49,16 @@ add_executable(${PROJECT_NAME}
     src/mode.c
     src/mt6835.c
     src/encoder.c
+    src/limits.c
+    src/params.c
+    src/trace.c
+    src/led.c
 )
 
 # The driver's UART. Both hardware UARTs belong to the desk bus, so the third
 # serial port is built in PIO. See src/tmc_uart.pio.
 pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/src/tmc_uart.pio)
+pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/src/ws2812.pio)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/include    # board_config.h

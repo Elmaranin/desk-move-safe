@@ -13,6 +13,7 @@
 #include "bus.h"
 #include "wire.h"
 #include "board_config.h"
+#include "trace.h"
 
 #include "pico/stdlib.h"
 #include "FreeRTOS.h"
@@ -23,6 +24,14 @@
 #define KEY_IDLE    0x00
 #define KEY_DOWN    0x06
 #define KEY_UP      0x08
+#define KEY_DOWN_E  0x05            // one frame: a 10 mm step
+#define KEY_UP_E    0x07
+
+static bool wait_sent(uint32_t timeout_ms);
+
+// The step-in in desk_move_to() relies on this: from more than NEAR short, one
+// step cannot end past the target.
+_Static_assert(DESK_NEAR_MM >= DESK_NUDGE_MM, "a step could overshoot the target");
 
 static volatile bool s_abort;
 
@@ -81,11 +90,32 @@ bool desk_move_to(uint16_t target_mm)
     uint16_t lead    = up ? cu : cd;
     int32_t  release = up ? (int32_t)target_mm - lead : (int32_t)target_mm + lead;
 
-    // Already past where we would release: driving now means arriving with no
-    // room to stop, and reversing to fix a centimetre is the fuss this avoids.
+    // Already past where we would release: a drive would coast past the
+    // target. Step instead — one tap is a fixed DESK_NUDGE_MM — while the
+    // desk is more than DESK_NEAR_MM short. Since NEAR >= NUDGE, a step from
+    // further than NEAR can never end past the target, so this only ever
+    // closes in from the short side. Without it, a desk raised to 754 by hand
+    // had its flap run there, 16 mm short of 770, and looked as if it never
+    // stopped for the flap at all.
     if (up ? cur >= release : cur <= release) {
-        printf("[desk] at %ld mm, inside the release point for %u — leaving it\n",
-               (long)cur, target_mm);
+        for (int tries = 0; tries < 3 && !s_abort; tries++) {
+            int32_t e = (int32_t)target_mm - cur;
+            if ((e < 0 ? -e : e) <= DESK_NEAR_MM)
+                break;
+            printf("[desk] at %ld mm, too close to %u to drive — stepping %s\n",
+                   (long)cur, target_mm, e > 0 ? "up" : "down");
+            wire_send_once(e > 0 ? KEY_UP_E : KEY_DOWN_E);
+            if (!wait_sent(WIRE_ONESHOT_TIMEOUT_MS))
+                return false;
+            int32_t landed = settle(1200, 6000);
+            if (landed < 0 || landed == cur) {
+                printf("[desk] the step did not move it — leaving it at %ld mm\n", (long)cur);
+                break;
+            }
+            cur = landed;
+        }
+        int32_t e = (int32_t)target_mm - cur;
+        printf("[desk] at %ld mm, %ld from %u\n", (long)cur, (long)(e < 0 ? -e : e), target_mm);
         return true;
     }
 
@@ -157,7 +187,9 @@ static bool wait_sent(uint32_t timeout_ms)
 static void run_flap(void)
 {
     printf("[flap] at the height — running the flap\n");
+    trace_add(TR_JOB, TRJ_FLAP_START, 0);
     vTaskDelay(pdMS_TO_TICKS(FLAP_MOVE_MS));
+    trace_add(TR_JOB, TRJ_FLAP_END, 0);
 }
 
 void flap_task(void *arg)
@@ -173,15 +205,20 @@ void flap_task(void *arg)
         s_abort = false;
 
         if (!key) {                     // from 'go': just the move
+            trace_add(TR_JOB, TRJ_GO, dest);
             desk_move_to(dest);
             flap_job_done();
+            trace_add(TR_JOB, s_abort ? TRJ_ABORTED : TRJ_DONE, 0);
             continue;
         }
+        trace_add(TR_JOB, TRJ_TAKE, dest);
 
         printf("[flap] taking over: stop at %u, flap, then on to %u mm\n",
                flap_height(), dest);
 
-        if (desk_move_to(flap_height()) && !s_abort) {
+        bool there = desk_move_to(flap_height());
+        trace_add(TR_JOB, TRJ_AT_FLAP, there);
+        if (there && !s_abort) {
             run_flap();
             if (!s_abort) {
                 // Resume by RE-ISSUING the recall, not by driving to the
@@ -199,10 +236,12 @@ void flap_task(void *arg)
                 // on where the second frame lands in the board's ~1 s of
                 // start-up latency, which is why it worked some of the time.
                 printf("[flap] resuming — re-sending the recall for %u mm\n", dest);
+                trace_add(TR_JOB, TRJ_RESUME, key);
                 wire_send_once(key);
-                wait_sent(WIRE_ONESHOT_TIMEOUT_MS);
+                trace_add(TR_JOB, TRJ_SENT, wait_sent(WIRE_ONESHOT_TIMEOUT_MS));
             }
         }
         flap_job_done();
+        trace_add(TR_JOB, s_abort ? TRJ_ABORTED : TRJ_DONE, 0);
     }
 }

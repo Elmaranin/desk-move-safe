@@ -9,6 +9,7 @@
 //
 #include "encoder.h"
 #include "mt6835.h"
+#include "limits.h"
 #include "board_config.h"
 
 #include "pico/stdlib.h"
@@ -121,6 +122,11 @@ void encoder_task(void *arg)
     printf("[enc] MT6835 ok, field %s, raw %lu\n",
            mt6835_status_str(st), (unsigned long)s_last);
 
+    // The first thing an absolute angle is for: say where the shaft is in the
+    // stored travel range before anyone asks it to move.
+    if (limits_calibrated())
+        limits_sync(true);
+
     TickType_t next = xTaskGetTickCount();
     for (;;) {
         // vTaskDelayUntil does not delay at all when the wake-up it was given
@@ -170,5 +176,9 @@ void encoder_task(void *arg)
             s_counts += d;
         }
         taskEXIT_CRITICAL();
+
+        // Every sample also goes past the travel guard. A few integer ops; it
+        // hard-stops the motor if the shaft has left the calibrated range.
+        limits_guard(raw);
     }
 }

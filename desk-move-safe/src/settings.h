@@ -11,38 +11,53 @@
 // mid-move, and never straight after a keystroke.
 //
 // ONE RECORD, ONE OWNER. nvs keeps exactly one record and this module is the
-// only thing that may write it. When the stepper arrives, its stored values go
-// in the `flap` section below and it marks the settings dirty like everything
-// else — it must NOT call nvs_write() for a record of its own, or the two
-// would take turns erasing each other.
+// only thing that may write it. limits.c keeps the flap's range in the `lim`
+// section below and marks the settings dirty like everything else — it must
+// NOT call nvs_write() for a record of its own, or the two would take turns
+// erasing each other.
+//
+// SECTION = PREFIX. Each section is named after the console group it belongs
+// to, and params.c shows every field as <section>_<field>: panel_stand_mm,
+// desk_coast_up_mm, lim_min_raw. The layout is unchanged from version 1 — the
+// panel/desk split moved no bytes — so a stored record still reads.
 //
 #include <stdbool.h>
 #include <stdint.h>
 
 typedef struct {
-    uint16_t preset_stand_mm;   // 0 = not known yet
-    uint16_t preset_sit_mm;
-    uint16_t coast_up_mm;
+    uint16_t stand_mm;          // the panel's preset heights; 0 = not known yet
+    uint16_t sit_mm;
+} settings_panel_t;
+
+typedef struct {
+    uint16_t coast_up_mm;       // run-on after being told to stop
     uint16_t coast_down_mm;
-    uint16_t flap_height_mm;
+    uint16_t flap_mm;           // where the desk is stopped for the flap
     uint16_t flap_on;
 } settings_desk_t;
 
 typedef struct {
-    // The bench rig's limits.c record, field for field, so the port is a copy.
-    // All zero until the stepper is wired.
+    // The bench rig's limits.c record, field for field. All zero until
+    // 'lim min' and 'lim max' are stored.
     uint32_t flags;
     uint32_t min_raw, max_raw;
     int32_t  enc_span, span_steps;
     uint32_t steps_per_rev;
     int32_t  backlash;
     float    approach_deg;
-} settings_flap_t;
+} settings_lim_t;
 
 typedef struct {
-    uint32_t        version;
-    settings_desk_t desk;
-    settings_flap_t flap;
+    uint32_t speed_sps;         // cruise rate, microsteps/s; 0 = board_config.h
+} settings_mot_t;
+
+typedef struct {
+    uint32_t         version;
+    settings_panel_t panel;
+    settings_desk_t  desk;
+    settings_lim_t   lim;
+    settings_mot_t   mot;       // version 2. New sections go at the END, so
+                                // an older record is this one, truncated.
 } settings_t;
 
 settings_t *settings(void);     // owners read and write their own section
@@ -51,6 +66,6 @@ void settings_load(void);       // at boot, before the bus runs
 void settings_mark_dirty(void); // from anywhere
 void settings_flush(void);      // console task: writes if dirty and idle
 bool settings_stored(void);     // was there a valid record at boot?
-void settings_forget(void);     // erase, and fall back to board_config.h
+bool settings_dirty(void);      // changed since the last write
 
 #endif // SETTINGS_H

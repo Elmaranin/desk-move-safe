@@ -17,7 +17,8 @@ desk-lab, which is kept locally and not published. None of that is here.
 
 - [../docs/wiring.md](../docs/wiring.md) — board, pin map, **what to cut**
 - [../docs/CL103B-G_protocol.md](../docs/CL103B-G_protocol.md) — the desk protocol
-- [docs/operation.md](docs/operation.md) — the console, and what it does at the desk
+- [docs/operation.md](docs/operation.md) — what it does at the desk, modes, bring-up
+- [docs/commands.md](docs/commands.md) — **every console command**, and every stored parameter
 
 ## Build
 

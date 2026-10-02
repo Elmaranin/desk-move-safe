@@ -11,6 +11,9 @@
 #include "encoder.h"
 #include "mt6835.h"
 #include "mode.h"
+#include "limits.h"
+#include "params.h"
+#include "trace.h"
 #include "board_config.h"
 
 #include "pico/stdlib.h"
@@ -30,31 +33,53 @@ static void cm(uint16_t mm, char *out, size_t n)
     snprintf(out, n, "%u.%u cm", mm / 10, mm % 10);
 }
 
+// Every line is "  <command>  <what it does>", two or more spaces between, and
+// docs/commands.md has a row for each. tools/check_commands.sh compares the two
+// on every build, so a command added here without its row fails the build.
+//
+// A handful of words at the top; everything else lives under a group word
+// (desk, lim, mot, tmc, enc), and every stored value is set with 'eeprom set'.
 static void help(void)
 {
     printf(
         "\n"
-        "  status              height, what it is doing, every setting\n"
-        "  flap [<cm>]         the height the desk is stopped at for the flap\n"
-        "  flap on|off         whether it stops there at all\n"
-        "  ceiling [on|off]    refuse UP past %u mm, whatever the panel asks\n"
-        "  presets             the stand and sit heights\n"
-        "  presets stand|sit <cm>   set one (0 = forget, re-learn it)\n"
-        "  coast <up> <down>   how far the desk runs on after being told to stop\n"
-        "  stop                stop now\n"
+        "  status              everything at a glance: self-check, desk, motor\n"
+        "  init                calibrate the flap, step by step — always available\n"
+        "  done                (init) store the position the flap is at now\n"
+        "  abort               (init) leave init; the desk stays locked\n"
+        "  stop                stop whatever the firmware is driving, now\n"
         "  dev                 working or dev mode, and the boot self-check\n"
         "  dev start|stop      unlock the development commands, or lock them\n"
+        "  eeprom              every stored parameter and its value\n"
+        "  eeprom <name>       one parameter\n"
+        "  eeprom set <name> <value>   change one; written to flash once idle\n"
+        "  ?                   this\n"
+        "\n"
+        "  desk                height, bus, flap stop, ceiling, presets, coast\n"
+        "  desk ceiling [on|off]   refuse UP past %u mm (session only)\n"
+        "  lim                 the flap's travel range: stored ends, where the shaft is\n"
+        "  debug               is the trace running\n"
+        "  debug start|stop    trace every desk decision as it happens, or stop\n"
         "\n"
         "  --- development only: 'dev start' first ---\n"
         "  go <cm>             drive the desk directly, bypassing the panel\n"
-        "  forget              erase the stored settings\n"
+        "  reset               clear the flap calibration: motor and DESK locked\n"
+        "\n"
+        "  lim min             store the shaft's position as min\n"
+        "  lim max             store it as max (same session as min)\n"
+        "  lim play [<deg>]    measure the gearbox backlash (before the ends)\n"
+        "  lim span [<n>]      re-measure the steps between the ends, or set them\n"
+        "  lim sync            re-seed the step counter from the encoder\n"
+        "  lim free            toggle: ignore the range until reset — careful\n"
+        "\n"
         "  mot                 the flap motor: what it is doing and how it is set\n"
         "  mot on|off          energise the coils, or release them\n"
-        "  mot speed <sps>     cruise rate, microsteps/s\n"
         "  mot accel <sps2>    ramp rate, microsteps/s^2\n"
-        "  mot move <steps>    signed microsteps, full accel/cruise/decel\n"
+        "  mot jog <steps>     small move, max one motor turn — works with no range\n"
+        "  mot go min|max|<n>  to an end, or n steps from min, then settle\n"
+        "  mot move <steps>    signed microsteps, inside the range\n"
         "  mot rev <revs>      signed revolutions OF THE FLAP SHAFT (%g:1 box)\n"
-        "  mot run fwd|back    run until 'mot stop'\n"
+        "  mot run fwd|back    to the end of travel that way\n"
         "  mot stop            ramp down\n"
         "  mot halt            cut the pulses now — loses position\n"
         "  mot zero            call this position zero\n"
@@ -73,16 +98,13 @@ static void help(void)
         "  enc zero            call this shaft position zero\n"
         "  enc dir [0|1]       which way the angle counts (a register, not a pin)\n"
         "  enc gear [<n>]      reducer between motor and magnet, N:1\n"
-        "  enc reg <hex> [hex]        read or write one sensor register\n"
-        "  ?                   this\n",
+        "  enc reg <hex> [hex]        read or write one sensor register\n",
         DESK_CEILING_MM, (double)GEAR_RATIO);
 }
 
-static void status(void)
+static void desk_status(void)
 {
     char buf[16];
-
-    mode_report();
     uint16_t mm, stand, sit, cu, cd;
     uint32_t age, bok, pok;
 
@@ -122,7 +144,13 @@ static void status(void)
 
     flap_coast(&cu, &cd);
     printf("coast     up %u mm | down %u mm\n", cu, cd);
-    printf("settings  %s\n", settings_stored() ? "restored from flash"
+}
+
+static void status(void)
+{
+    mode_report();
+    desk_status();
+    printf("settings  %s\n", settings_stored() ? "restored from flash — 'eeprom' lists it"
                                                : "defaults (nothing stored yet)");
 
     if (!TMC_UART_ENABLED) {
@@ -370,6 +398,51 @@ static void mot_status(void)
     printf("driver  %s\n", tmc2209_status_line(line, sizeof line));
 }
 
+// Wait for the motor to stop, any key stopping it early — the console is
+// blocked meanwhile, so this is the only way to say "stop".
+static bool wait_or_key(uint32_t timeout_ms)
+{
+    vTaskDelay(pdMS_TO_TICKS(60));                      // the \n after the \r
+    while (getchar_timeout_us(0) != PICO_ERROR_TIMEOUT)
+        tight_loop_contents();
+    TickType_t t0 = xTaskGetTickCount();
+    while (stepper_busy()) {
+        if (getchar_timeout_us(0) != PICO_ERROR_TIMEOUT) {
+            stepper_stop();
+            printf("stopping — key pressed\n");
+            stepper_wait(5000);
+            return false;
+        }
+        if (xTaskGetTickCount() - t0 > pdMS_TO_TICKS(timeout_ms)) {
+            stepper_stop_hard();
+            printf("move timed out\n");
+            return false;
+        }
+        limits_poll_trip();
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return true;
+}
+
+// A targeted move is not over when the pulses stop: the shaft is asked where
+// it is and crept onto the target. From the bench rig.
+static void settle_after_move(void)
+{
+    if (!wait_or_key(120000))
+        return;
+    vTaskDelay(pdMS_TO_TICKS(100));             // let the load come to rest
+    double  err;
+    int32_t crept;
+    int r = limits_settle(&err, &crept);
+    if (r < 0)
+        return;                                 // nothing to settle
+    if (r == 0)
+        printf("settled %+.3f deg from target, %ld steps crept\n", err, (long)crept);
+    else
+        printf("NOT SETTLED: crept %ld steps and the shaft is still %+.3f deg off — the\n"
+               "  output is not following the motor here\n", (long)crept, err);
+}
+
 static void mot(char *arg)
 {
     if (!arg) { mot_status(); return; }
@@ -384,8 +457,8 @@ static void mot(char *arg)
         printf("coils %s\n", on ? "energised" : "released — the flap turns by hand");
 
     } else if (!strcmp(arg, "speed")) {
-        if (v) stepper_set_speed((uint32_t)strtoul(v, NULL, 10));
-        printf("speed %lu microsteps/s\n", (unsigned long)stepper_speed());
+        printf("speed %lu microsteps/s — stored; 'eeprom set mot_speed_sps <n>' changes it\n",
+               (unsigned long)stepper_speed());
 
     } else if (!strcmp(arg, "accel")) {
         if (v) stepper_set_accel((uint32_t)strtoul(v, NULL, 10));
@@ -402,23 +475,43 @@ static void mot(char *arg)
             ? (int32_t)n
             : (int32_t)(n * (double)stepper_steps_per_rev() * (double)GEAR_RATIO);
         if (steps == 0) { printf("that rounds to no steps at all\n"); return; }
-        if (!stepper_move(steps)) {
-            printf("%s\n", stepper_busy() ? "already moving — 'mot stop' first"
-                                          : "the driver would not enable");
-            return;
-        }
+        if (!limits_move(steps))
+            return;                     // limits.c has said why
         printf("moving %+ld microsteps (%.3f rev of the flap shaft)\n",
                (long)steps,
                (double)steps / (double)stepper_steps_per_rev() / (double)GEAR_RATIO);
 
-    } else if (!strcmp(arg, "run")) {
-        bool fwd = !v || !strcmp(v, "fwd") || !strcmp(v, "f");
-        if (!stepper_run(fwd)) {
-            printf("%s\n", stepper_busy() ? "already moving — 'mot stop' first"
-                                          : "the driver would not enable");
+    } else if (!strcmp(arg, "jog")) {
+        if (!v) { printf("usage: mot jog <signed microsteps>, at most one motor turn\n"); return; }
+        int32_t steps = (int32_t)strtol(v, NULL, 10);
+        if (!limits_jog(steps))
+            return;
+        if (limits_targeted())
+            settle_after_move();
+        else
+            printf("jog %+ld microsteps\n", (long)steps);
+
+    } else if (!strcmp(arg, "go")) {
+        bool ok;
+        if (v && !strcmp(v, "min"))      ok = limits_goto_end(false);
+        else if (v && !strcmp(v, "max")) ok = limits_goto_end(true);
+        else if (v)                      ok = limits_goto((int32_t)strtol(v, NULL, 10));
+        else {
+            printf("usage: mot go min | mot go max | mot go <steps from min, 0..%ld>\n",
+                   (long)limits_span_steps());
             return;
         }
-        printf("running %s — 'mot stop' to ramp down\n", fwd ? "forward" : "back");
+        if (ok)
+            settle_after_move();
+
+    } else if (!strcmp(arg, "run")) {
+        bool fwd = !v || !strcmp(v, "fwd") || !strcmp(v, "f");
+        if (limits_mode() == LIM_FREE) {
+            if (!limits_run(fwd)) return;
+            printf("running %s — 'mot stop' to ramp down\n", fwd ? "forward" : "back");
+        } else if (limits_run(fwd)) {
+            settle_after_move();        // bounded: a move to that end
+        }
 
     } else if (!strcmp(arg, "stop")) {
         stepper_stop();
@@ -640,10 +733,106 @@ static void tmc(char *arg)
 // figures, 'stop' — stays. What is behind the gate is everything that drives
 // something directly or pokes at a register, because none of that has any
 // business happening because of a mistyped line on a desk in use.
+// ---- init: guided calibration ---------------------------------------------
+//
+// Always available, working mode included: a board without its calibration
+// has a locked desk, and whoever is in front of it must be able to fix that
+// without knowing about dev mode. It clears the calibration at once (what
+// 'reset' clears), then asks for the flap at min, then at max, and stores each
+// on 'done'. Everything else the range needs — the span in sensor counts and
+// in motor steps — limits.c works out from those two marks.
+//
+// While it runs, 'mot' and 'enc' are unlocked so the flap can be positioned.
+// 'mot jog' moves it, one motor turn at most per command since there is no
+// range yet to check a bigger move against, and an empty line repeats the last
+// jog. Turning the flap by hand does NOT work: the steps between the ends are
+// counted from the motor's own moves, and a hand-turned end has none.
+
+typedef enum { INIT_OFF, INIT_MIN, INIT_MAX } init_t;
+static init_t s_init;
+static char   s_repeat[LINE_MAX];       // the last 'mot jog' typed during init
+
+static const char *prompt(void)
+{
+    return s_init == INIT_MIN ? "init min> " : s_init == INIT_MAX ? "init max> " : "> ";
+}
+
+static void init_ask(void)
+{
+    printf("\nINIT %s — move the flap to its %s with the motor:\n"
+           "  mot jog <steps>   signed, at most %lu per command; Enter repeats it\n"
+           "  enc               where the shaft is\n"
+           "  done              store this position\n"
+           "  abort             leave init (the desk stays locked)\n",
+           s_init == INIT_MIN ? "1/2" : "2/2",
+           s_init == INIT_MIN ? "MIN position (one end of its travel)"
+                              : "MAX position (the other end)",
+           (unsigned long)stepper_steps_per_rev());
+}
+
+static void init_start(void)
+{
+    if (flap_busy()) {
+        printf("not now — the desk is mid-sequence (%s). 'stop' first.\n",
+               flap_state_str());
+        return;
+    }
+    if (stepper_busy()) { printf("the motor is moving — 'stop' first\n"); return; }
+    if (!encoder_available()) {
+        printf("init needs the MT6835 and it is not answering. Nothing was\n"
+               "cleared. 'dev start' then 'enc' says what to check.\n");
+        return;
+    }
+    if (!limits_clear())                // prints what it cleared and kept
+        return;
+    s_repeat[0] = '\0';
+    s_init = INIT_MIN;
+    stepper_enable(true);               // hold the flap where the jogs leave it
+    init_ask();
+}
+
+static void init_done(void)
+{
+    if (stepper_busy()) { printf("still moving — wait for it, then 'done'\n"); return; }
+    if (s_init == INIT_MIN) {
+        if (!limits_mark(false))
+            return;                     // limits.c has said why; still at min
+        s_init = INIT_MAX;
+        init_ask();
+        return;
+    }
+    limits_mark(true);
+    if (!limits_calibrated()) {
+        // limits.c has kept only one end; the clean retry is from the top.
+        limits_clear();
+        s_init = INIT_MIN;
+        printf("that did not make a usable range — starting again from min.\n");
+        init_ask();
+        return;
+    }
+    s_init = INIT_OFF;
+    printf("\nINIT COMPLETE — the desk is unlocked. Stored:\n");
+    params_print("lim_min_raw");
+    params_print("lim_max_raw");
+    params_print("lim_enc_span");
+    params_print("lim_span_steps");
+    printf("written to flash in a couple of seconds.\n");
+}
+
+static void init_abort(void)
+{
+    s_init = INIT_OFF;
+    stepper_stop();
+    printf("init aborted — the flap is NOT calibrated, so the DESK stays locked.\n"
+           "'init' starts again.\n");
+}
+
 static bool unlocked(const char *cmd)
 {
     if (mode_dev())
         return true;
+    if (s_init && (!strcmp(cmd, "mot") || !strcmp(cmd, "enc")))
+        return true;                    // positioning the flap for init
     printf("'%s' is a development command and this board is in working mode.\n"
            "'dev start' unlocks it. It relocks at the next reset — there is no\n"
            "stored mode, so a production board always comes up working.\n", cmd);
@@ -661,110 +850,134 @@ static void dev(char *arg)
         printf("usage: dev start | dev stop | dev\n");
 }
 
-static void dispatch(char *line)
+// 'lim' alone is a report and works in working mode; everything that moves the
+// motor or changes the stored range is development. Its two typed-in values,
+// backlash and approach, are parameters: 'eeprom set lim_backlash|lim_approach_deg'.
+static void lim(char *arg)
 {
-    char *cmd = strtok(line, " \t");
-    if (!cmd) return;
-    char *arg = strtok(NULL, " \t");
+    if (!arg) { limits_report(); return; }
+    if (!unlocked("lim")) return;
+    char *v = strtok(NULL, " \t");
+
+    if (!strcmp(arg, "min"))        limits_mark(false);
+    else if (!strcmp(arg, "max"))   limits_mark(true);
+    else if (!strcmp(arg, "sync"))  limits_sync(true);
+    else if (!strcmp(arg, "free"))  limits_set_free(limits_mode() != LIM_FREE);
+    else if (!strcmp(arg, "span")) {
+        if (!v) limits_store_span();
+        else    limits_set_span((int32_t)strtol(v, NULL, 10));
+    } else if (!strcmp(arg, "play")) {
+        limits_measure_play(v ? strtod(v, NULL) : 1.0);
+    } else {
+        printf("usage: lim [min | max | play [deg] | span [n] | sync | free]\n");
+    }
+}
+
+static void desk(char *arg)
+{
+    if (!arg) { desk_status(); return; }
+    char *v = strtok(NULL, " \t");
     char buf[16];
 
-    if (!strcmp(cmd, "?") || !strcmp(cmd, "help")) {
-        help();
-
-    } else if (!strcmp(cmd, "status") || !strcmp(cmd, "p")) {
-        status();
-
-    } else if (!strcmp(cmd, "flap")) {
-        if (arg && !strcmp(arg, "on"))       { flap_set_enabled(true);  settings_mark_dirty(); }
-        else if (arg && !strcmp(arg, "off")) { flap_set_enabled(false); settings_mark_dirty(); }
-        else if (arg) {
-            uint16_t mm;
-            if (!parse_cm(arg, &mm) ||
-                mm < DESK_MIN_MM + DESK_NEAR_MM || mm > DESK_CEILING_MM - DESK_NEAR_MM) {
-                printf("usage: flap <cm>, between %u.%u and %u.%u\n",
-                       (DESK_MIN_MM + DESK_NEAR_MM) / 10, (DESK_MIN_MM + DESK_NEAR_MM) % 10,
-                       (DESK_CEILING_MM - DESK_NEAR_MM) / 10, (DESK_CEILING_MM - DESK_NEAR_MM) % 10);
-                return;
-            }
-            flap_set_height(mm);
-            settings_mark_dirty();
-        }
-        cm(flap_height(), buf, sizeof buf);
-        printf("flap %s at %u mm (%s)\n", flap_enabled() ? "ON" : "off",
-               flap_height(), buf);
-
-    } else if (!strcmp(cmd, "ceiling")) {
-        if (arg && !strcmp(arg, "on"))       flap_set_ceiling(true);
-        else if (arg && !strcmp(arg, "off")) flap_set_ceiling(false);
+    if (!strcmp(arg, "ceiling")) {
+        if (v && !strcmp(v, "on"))       flap_set_ceiling(true);
+        else if (v && !strcmp(v, "off")) flap_set_ceiling(false);
+        else if (v) { printf("usage: desk ceiling [on|off]\n"); return; }
         cm(flap_ceiling_mm(), buf, sizeof buf);
         printf("ceiling %s at %u mm (%s) — UP refused from %u up. %lu refused so far.\n",
                flap_ceiling_on() ? "ON" : "off", flap_ceiling_mm(), buf,
                flap_ceiling_mm() - DESK_COAST_UP_MM, (unsigned long)flap_blocked_ups());
+    } else {
+        printf("unknown: 'desk %s'  ('?' for help)\n", arg);
+    }
+}
 
-    } else if (!strcmp(cmd, "presets")) {
-        if (arg) {
-            uint8_t key = !strcmp(arg, "stand") ? 0x01 : !strcmp(arg, "sit") ? 0x02 : 0;
-            char *v = strtok(NULL, " \t");
-            uint16_t mm = 0;
-            if (!key || !v || (strcmp(v, "0") && !parse_cm(v, &mm))) {
-                printf("usage: presets stand <cm> | presets sit <cm> | presets sit 0\n"
-                       "Knowing a preset's height lets its recall be caught before the\n"
-                       "board hears it, so nothing starts moving and nothing has to be\n"
-                       "stopped. They are learned on first use if you leave them unset.\n");
-                return;
-            }
-            if (!flap_set_preset(key, mm)) {
-                printf("rejected: must be 0, or between %u and %u mm\n",
-                       DESK_MIN_MM, DESK_MAX_MM);
-                return;
-            }
-            settings_mark_dirty();
-        }
-        uint16_t stand, sit;
-        printf("presets stand ");
-        if (flap_preset(0x01, &stand)) printf("%u mm", stand); else printf("not known yet");
-        printf(" | sit ");
-        if (flap_preset(0x02, &sit))   printf("%u mm", sit);   else printf("not known yet");
-        printf("\n");
+static void eeprom(char *arg)
+{
+    if (!arg) { params_print_all(); return; }
+    if (!strcmp(arg, "set")) {
+        char *name  = strtok(NULL, " \t");
+        char *value = strtok(NULL, " \t");
+        if (!name || !value) { printf("usage: eeprom set <name> <value>\n"); return; }
+        params_set(name, value);
+        return;
+    }
+    if (!params_print(arg))
+        printf("no parameter '%s' — 'eeprom' lists them\n", arg);
+}
 
-    } else if (!strcmp(cmd, "coast")) {
-        if (arg) {
-            char *d = strtok(NULL, " \t");
-            if (!d || !flap_set_coast((uint16_t)strtoul(arg, NULL, 10),
-                                      (uint16_t)strtoul(d, NULL, 10))) {
-                printf("usage: coast <up_mm> <down_mm>, e.g. 'coast 18 19'\n"
-                       "How far the desk runs on after being told to stop. Two figures\n"
-                       "because it is not the same in both directions. They need not be\n"
-                       "exact — anything inside %u mm of the mark is close enough.\n",
-                       DESK_NEAR_MM);
-                return;
-            }
-            settings_mark_dirty();
-        }
-        uint16_t cu, cd;
-        flap_coast(&cu, &cd);
-        printf("coast up %u mm | down %u mm\n", cu, cd);
+static void dispatch(char *line)
+{
+    // Remember a jog typed during init before strtok cuts the line up.
+    if (s_init && !strncmp(line, "mot jog ", 8))
+        snprintf(s_repeat, sizeof s_repeat, "%s", line);
+
+    char *cmd = strtok(line, " \t");
+    if (!cmd) return;
+    char *arg = strtok(NULL, " \t");
+
+    if (!strcmp(cmd, "?")) {
+        help();
+
+    } else if (!strcmp(cmd, "init")) {
+        init_start();
+
+    } else if (!strcmp(cmd, "done")) {
+        if (s_init) init_done();
+        else        printf("'done' answers 'init' — nothing is waiting for it\n");
+
+    } else if (!strcmp(cmd, "abort")) {
+        if (s_init) init_abort();
+        else        printf("'abort' leaves 'init' — which is not running\n");
+
+    } else if (!strcmp(cmd, "status")) {
+        status();
+
+    } else if (!strcmp(cmd, "stop")) {
+        desk_abort();
+        stepper_stop();
+        printf("stopping\n");
 
     } else if (!strcmp(cmd, "dev")) {
         dev(arg);
+
+    } else if (!strcmp(cmd, "eeprom")) {
+        eeprom(arg);
+
+    } else if (!strcmp(cmd, "desk")) {
+        desk(arg);
+
+    } else if (!strcmp(cmd, "debug")) {
+        if (!arg)                       trace_report();
+        else if (!strcmp(arg, "start")) {
+            trace_set(true);
+            printf("debug trace ON — every change is printed as [dbg <seconds>].\n"
+                   "Reproduce the problem, then 'debug stop'. Nothing is stored.\n");
+        } else if (!strcmp(arg, "stop")) {
+            trace_drain();
+            trace_set(false);
+            printf("debug trace off\n");
+        } else printf("usage: debug [start|stop]\n");
+
+    } else if (!strcmp(cmd, "lim")) {
+        lim(arg);
 
     } else if (!strcmp(cmd, "go")) {
         if (!unlocked(cmd)) return;
         uint16_t mm;
         if (!arg || !parse_cm(arg, &mm)) { printf("usage: go <cm>, e.g. 'go 73.5'\n"); return; }
+        if (!mode_desk_may_move()) {
+            printf("refused: DESK LOCKED — %s. 'lim' for how.\n", mode_desk_blocked_by());
+            return;
+        }
         if (!flap_go(mm)) { printf("busy: %s\n", flap_state_str()); return; }
 
-    } else if (!strcmp(cmd, "stop")) {
-        desk_abort();
-        printf("stopping\n");
-
-    } else if (!strcmp(cmd, "forget")) {
+    } else if (!strcmp(cmd, "reset")) {
         if (!unlocked(cmd)) return;
-        settings_forget();
-        flap_set_preset(0x01, 0);
-        flap_set_preset(0x02, 0);
-        printf("stored settings erased — presets unknown again; the rest returns to\n"
-               "board_config.h at the next boot\n");
+        // Only what the lock depends on. Presets, coast, the flap height,
+        // backlash and approach are kept — 'eeprom set' changes those.
+        if (limits_clear())
+            printf("'init' calibrates it again.\n");
 
     } else if (!strcmp(cmd, "mot")) {
         if (!unlocked(cmd)) return;
@@ -791,6 +1004,7 @@ void console_task(void *arg)
     bool spoken_to = false;
     TickType_t last_greet = 0;
     unsigned greets = 0;
+    int prev = 0;
 
     for (;;) {
         // Repeat the banner briefly: flashing re-enumerates USB, so a terminal
@@ -800,13 +1014,17 @@ void console_task(void *arg)
             (last_greet == 0 || now - last_greet >= pdMS_TO_TICKS(GREET_PERIOD_MS))) {
             printf("\n=== desk-move-safe ===\n");
             status();
-            printf("'?' for commands.\n> ");
+            if (!limits_calibrated())
+                printf("The flap is not calibrated — type 'init' to do it.\n");
+            printf("'?' for commands.\n%s", prompt());
             last_greet = now ? now : 1;
             greets++;
             len = 0;
         }
 
         settings_flush();       // writes only when idle and settled
+        limits_poll_trip();     // a guard trip, said once
+        trace_drain();          // 'debug start' events, if any
 
         int c = getchar_timeout_us(0);
         if (c == PICO_ERROR_TIMEOUT) {
@@ -815,12 +1033,25 @@ void console_task(void *arg)
         }
         spoken_to = true;
 
+        // CRLF is one Enter, not two: otherwise the \n after a line would be
+        // an empty line, and during init an empty line repeats the last jog.
+        bool lf_of_crlf = (c == '\n' && prev == '\r');
+        prev = c;
+        if (lf_of_crlf)
+            continue;
+
         if (c == '\r' || c == '\n') {
             printf("\n");
             line[len] = '\0';
-            if (len) dispatch(line);
+            if (len) {
+                dispatch(line);
+            } else if (s_init && s_repeat[0]) {
+                snprintf(line, sizeof line, "%s", s_repeat);
+                printf("%s\n", line);
+                dispatch(line);
+            }
             len = 0;
-            printf("> ");
+            printf("%s", prompt());
         } else if (c == '\b' || c == 0x7f) {
             if (len) { len--; printf("\b \b"); }
         } else if (c >= 0x20 && c < 0x7f && len < LINE_MAX - 1) {

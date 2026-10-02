@@ -32,6 +32,7 @@ static volatile uint32_t s_dir_us;
 
 static volatile uint16_t s_target_mm;
 static volatile bool     s_have_target;
+static volatile uint32_t s_target_gen;  // +1 per announcement
 
 static uint16_t s_prev_mm;
 static uint32_t s_prev_us;
@@ -61,6 +62,7 @@ static void on_height(uint16_t mm, uint32_t now_us)
             if (++s_reject_run <= DESK_ANNOUNCE_MAX_FRAMES) {
                 s_target_mm   = mm;
                 s_have_target = true;
+                s_target_gen++;
                 return;                 // not a height
             }
             // Said so for too long to be an announcement: the stream and our
@@ -182,6 +184,8 @@ int8_t desk_direction(void)
         return 0;
     return d;
 }
+
+uint32_t desk_target_gen(void) { return s_target_gen; }
 
 bool desk_target_mm(uint16_t *mm)
 {

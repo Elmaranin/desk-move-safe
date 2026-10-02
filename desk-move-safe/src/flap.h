@@ -39,6 +39,9 @@ void flap_task(void *arg);      // runs the stop-flap-continue sequence
 // Returns a key code, or WIRE_NO_FRAME.
 uint8_t flap_decide(uint8_t panel_code);
 
+// Moves refused because mode_desk_may_move() said no. See mode.h.
+uint32_t flap_refused_moves(void);
+
 // Handed to flap_task: stop the desk at the flap height, run the flap, then
 // finish the move by re-issuing this recall.
 bool flap_job_take(uint8_t *preset_key, uint16_t *destination_mm);
@@ -50,6 +53,11 @@ bool flap_go(uint16_t mm);
 
 const char *flap_state_str(void);
 bool        flap_busy(void);
+
+// The desk is at rest: nothing driving it, the height unchanged and no move
+// key sent for a few seconds — whoever started the move, us or the board.
+// The only time settings.c may write flash.
+bool        flap_desk_still(void);
 
 // ---- settings (all persisted) ---------------------------------------------
 
@@ -69,6 +77,7 @@ bool     flap_set_coast(uint16_t up, uint16_t down);
 // What a preset is worth. Learned from the board's announcements; setting
 // them by hand means even the first press is clean. 0 forgets one.
 bool flap_preset(uint8_t key, uint16_t *mm);        // key: 0x01 stand, 0x02 sit
+uint16_t flap_preset_stored(uint8_t key);           // as in flash, trusted or not
 bool flap_set_preset(uint8_t key, uint16_t mm);
 
 #endif // FLAP_H

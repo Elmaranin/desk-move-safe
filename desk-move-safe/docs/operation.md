@@ -39,10 +39,54 @@ start-up latency, which is exactly what an intermittent fault looks like.
 The first press of each preset is the exception: its height is unknown, so the
 recall is forwarded, the announcement is read, the desk is stopped, and the
 height is learned and written to flash. Every press after that — including
-after a reset — is the clean path. `presets stand 80.3` skips even that.
+after a reset — is the clean path. `eeprom set panel_stand_mm 803` skips even that.
+
+**The presets are the only settings stored automatically**, and only when
+they really change:
+
+1. At startup the stored stand and sit heights are read once.
+2. Every stand or sit recall that reaches the board is watched for *its own*
+   announced destination — one that arrives after the recall. (The board's
+   previous announcement is still held and must not be mistaken for it; that is
+   how stand was once learned as the sit height.)
+3. The announced height is compared with the stored one. **Different:**
+   `[flap] preset stand: 803 -> 805 mm — stored`, written to flash once the
+   desk is still. **Same:** nothing is written.
+4. Saving a preset on the panel writes nothing either.
+   The preset is only marked untrusted — no takeover relies on it — until its
+   next recall, which either confirms it (`confirmed … nothing written`) or
+   stores the new height.
+
+This happens in dev mode, with the flap off and right after a flap move alike;
+watching changes nothing on the bus. A recall issued while the desk is already
+at that preset is not announced, so it teaches nothing.
+
+Everything else is written only when asked: `eeprom set`, `init`, `lim`,
+`reset`. Two one-off exceptions, both after a firmware update: a record in an
+older layout is rewritten in the new one, and the flap's step count is rescaled
+if the microstepping changed.
 
 A **held** up/down press has no announcement, since nobody knows where the user
 will let go, so that one is stopped as it approaches.
+
+A **recall that slipped past the takeover** — pressed during the hands-off
+window after a flap move, say — is still stopped as it approaches, and then
+treated as the takeover would have treated it: the flap runs and the recall is
+sent again to finish the move (`[flap] it is a recall to … — the flap, then the
+recall again`). Before 2026-10-02 it was stopped like a held press and left
+there, so the desk stayed at the flap height.
+
+A **tap** of up/down is a fixed 10 mm step that ends by itself, and the only
+way to stop one is a tap the other way — which is a step back. So a tap is
+judged by where it will end, not by how close it gets:
+
+- ending short of the flap height: left alone, however close it gets;
+- ending past it: **not sent**, and `[flap] a tap from … would end past … —
+  not sent` is printed. A second tap goes through (the flap is disarmed by the
+  first). If the press turns out to be a hold, it is stopped like any held move.
+
+Before this, a tap from 742 mm toward a flap at 770 was "stopped" at 752 with a
+down tap, and the desk stepped straight back to 742.
 
 ## Working mode and dev mode
 
@@ -63,22 +107,29 @@ A check can say **`not in this build`**, which is not a failure. "Not built" and
 "broken" need different reactions, and collapsing them into one bool is how a
 firmware ends up refusing to work because of a feature nobody has written yet.
 
-**A failed check switches the flap off, not the desk.** Stopping a move at the
-flap height and then failing to move the flap is strictly worse than never
-stopping it — the user gets an interrupted move and a beep in exchange for
-nothing. So the intercept goes quiet, `status` says why, and the panel drives the
-desk exactly as it did before this board was fitted.
+**A failed encoder or limits check locks the desk.** The flap sits in the
+desk's path, and a flap left open is in the way: until the firmware can see the
+flap and knows where its ends are, it cannot tell whether a move is safe. So
+every UP, DOWN and preset recall — from the panel or from `go` — is replaced with
+idle, the board's LED blinks red at each refused press, and `status` shows
+`DESK LOCKED` and why. A stuck desk is the cheaper
+failure. Decided 2026-10-02 while the flap is being fitted; the earlier rule
+(switch the flap off and let the panel drive) may return once the flap is in
+use. The driver check does not lock the desk — in standalone mode it cannot be
+asked. [commands.md](commands.md#what-it-needs-to-move) lists exactly what it needs and how to calibrate; `reset` clears just that.
 
-While `FLAP_DRIVES_MOTOR` is 0 the flap is a two-second dwell that touches no
-motor, so none of the checks gate it; they are reported and nothing more. Setting
-it to 1 in step 4 makes all three hard requirements at the same moment they start
-to matter.
+While `FLAP_DRIVES_MOTOR` is 0 the flap itself is a two-second dwell that touches
+no motor, so the checks do not gate the *flap*; setting it to 1 in step 4 makes
+all three requirements for running it.
 
 ### `dev start`
 
-Unlocks the commands that drive something directly or poke at a register:
-`mot`, `tmc`, `go`, `forget`. Everything an installer needs — `flap`, `ceiling`,
-`presets`, `coast`, `status`, `stop` — stays available in working mode, because
+Unlocks the commands that drive something directly, poke at a register or
+change the flap's stored range: `mot`, `tmc`, `enc`, `lim min`/`max` and the
+rest of `lim`, `go`, `reset`, and `eeprom set` for the `lim_*` and `mot_*`
+parameters. Everything an installer needs — `status`, `init`, `desk`, `debug`,
+`eeprom` and `eeprom set` for the `panel_*` and `desk_*` parameters, `lim`,
+`stop` — stays available in working mode, because
 working mode is not a reduced console, it is the console for a board doing its
 job.
 
@@ -91,32 +142,26 @@ It is gone at the next reset.
 
 ## Console (USB CDC)
 
-```text
-status              height, what it is doing, every setting
-flap [<cm>]         the height the desk is stopped at for the flap
-flap on|off         whether it stops there at all
-ceiling [on|off]    refuse UP past the safe limit, whatever the panel asks
-presets             the stand and sit heights
-presets stand|sit <cm>   set one (0 = forget it and re-learn)
-coast <up> <down>   how far the desk runs on after being told to stop
-go <cm>             move the desk to a height
-stop                stop now
-forget              erase the stored settings
-```
-
-Every setting shows itself when given no argument and changes nothing.
+Every command, with what it does and which mode it needs:
+**[commands.md](commands.md)**. `?` on the board prints the short list; the
+build fails if the two disagree.
 
 ### What is stored in flash
 
 The preset heights, both coast figures, the flap height and whether the flap
-stop is enabled — one CRC-checked record in the last flash sector, restored at
-boot before the bus runs.
+stop is enabled, the flap's calibration (min and max angle, the steps between
+them, backlash, approach) and the flap motor's speed — one CRC-checked record
+in the last flash sector, restored at boot before the bus runs. `eeprom` lists
+every field; [commands.md](commands.md#parameters-explained) explains each one.
 
-Written once the settings have been untouched for a couple of seconds and
-never mid-move: a flash write blanks interrupts for tens of milliseconds.
+Written once the settings have been untouched for a couple of seconds **and
+the desk has been still for three**: no height change and no move key or recall
+sent, whoever started the move — a flash write blanks interrupts for tens of
+milliseconds. Before 2026-10-02 only the firmware's own moves held it off, so a
+recall passed to the board could be interrupted by a save at mid-height.
 
 Not stored, and from `board_config.h` every boot: proxying (always on), the
-ceiling, and the protocol constants.
+ceiling switch, `mot accel`, and the protocol constants.
 
 ## Bring-up
 
@@ -129,16 +174,23 @@ ceiling, and the protocol constants.
      ground leaves both lines silent while the panel and board still talk to
      each other perfectly.
    - `height never seen` with the panel heard means GP1 is on the wrong pin.
-3. `presets stand <cm>` and `presets sit <cm>` if you know them — otherwise
-   press each one once and let it learn.
-4. `flap 77` to set the height, `flap on`, and try a preset each way.
+3. **Calibrate the flap, or the desk will not move:** `init`, and follow it —
+   jog the flap to min, `done`, to max, `done`. `status` should no longer say
+   `DESK LOCKED`. [commands.md](commands.md#calibrating-with-init) has the detail.
+4. `eeprom set panel_stand_mm <mm>` and `eeprom set panel_sit_mm <mm>` if you
+   know them — otherwise press each one once and let it learn.
+5. `eeprom set desk_flap_mm 770` for the height, `eeprom set desk_flap_on 1`,
+   and try a preset each way.
 
 ## Tuning
 
-`coast` is how far the desk runs on after being told to stop. It is not the
-same in both directions, and it does not need to be exact — anything that
-lands inside `DESK_NEAR_MM` (10 mm) of the mark is close enough, and stopping
-*short* is the safe side, since the flap then runs before the desk has crossed.
+Coast (`desk_coast_up_mm`, `desk_coast_down_mm`) is how far the desk keeps
+moving after being told to stop, so a stop meant to land at a height is sent
+that much early — [commands.md](commands.md#parameters-explained) has a picture.
+It is not the same in both directions, and it does not need to be exact —
+anything that lands inside `DESK_NEAR_MM` (10 mm) of the mark is close enough,
+and stopping *short* is the safe side, since the flap then runs before the desk
+has crossed.
 
 `go` reports where it actually landed, which is the number to tune against.
 

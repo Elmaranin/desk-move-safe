@@ -35,6 +35,13 @@ int8_t desk_direction(void);
 // frame that jumps too far to be real, which is also how it is recognised.
 bool desk_target_mm(uint16_t *mm);
 
+// The announcement is KEPT after the move — it is the last one, not the
+// current one. Each announcement bumps this number, so whoever waits for "the
+// destination of the recall just sent" records it at the recall and accepts
+// only an announcement with a different number. Reading desk_target_mm()
+// without that check is how the old sit destination got learned as stand.
+uint32_t desk_target_gen(void);
+
 // Good frames seen on each line, for the status report.
 void bus_counts(uint32_t *board_ok, uint32_t *panel_ok);
 

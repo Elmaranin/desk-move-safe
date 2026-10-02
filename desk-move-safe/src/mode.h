@@ -23,12 +23,14 @@
 // "broken" need different reactions, and collapsing them into one bool is how a
 // firmware ends up refusing to work because of a feature nobody has written.
 //
-// NOT FIT MEANS PASS-THROUGH, NOT AN ERROR. If the flap cannot run, the desk
-// must still be a desk. Stopping a move at the flap height and then failing to
-// move the flap is strictly worse than never stopping it: the user gets an
-// interrupted move and a beep in exchange for nothing. So a failed check
-// switches the intercept OFF and says why, and the panel drives the desk
-// exactly as it did before this board was fitted.
+// NOT FIT MEANS THE DESK DOES NOT MOVE. The flap sits in the desk's path, and a
+// flap that was left open is in the way. If the encoder does not answer or the
+// flap's min and max are not stored, the firmware cannot tell whether moving
+// the desk is safe, so it refuses every move — panel, presets and 'go' alike —
+// and says why in 'status'. Decided 2026-10-02, while the flap is being fitted;
+// the earlier rule (switch the flap off, let the panel drive) may come back
+// once the flap is in use. The driver check does not gate this: standalone, it
+// cannot be asked.
 //
 // DEV MODE ALSO SUSPENDS THE INTERCEPT, for the same reason from the other
 // side: someone hand-driving the motor must not have the desk take the bus out
@@ -55,6 +57,11 @@ bool mode_flap_may_run(void);
 
 // One line saying why not, for the console and the boot log. Empty if it may.
 const char *mode_flap_blocked_by(void);
+
+// May the desk move at all? Encoder answering and both ends stored. Consulted
+// by flap_decide() on every panel frame and by 'go'.
+bool        mode_desk_may_move(void);
+const char *mode_desk_blocked_by(void);     // "" when it may
 
 // The self-check, one line per item.
 void mode_report(void);

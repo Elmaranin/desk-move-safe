@@ -6,6 +6,8 @@
 #include "wire.h"
 #include "mode.h"
 #include "settings.h"
+#include "trace.h"
+#include "led.h"
 #include "board_config.h"
 
 #include "pico/stdlib.h"
@@ -64,6 +66,7 @@ static volatile bool s_job_running;
 static uint8_t       s_job_key;         // the recall to re-issue when done
 static uint16_t      s_job_dest;
 static uint16_t      s_plan_from;
+static uint32_t      s_plan_gen;        // announcements before the recall
 static TickType_t    s_plan_started;
 
 // Hands off while a resumed move finishes
@@ -125,16 +128,74 @@ static bool approaching(int8_t dir, int32_t mm)
     return mm > h && mm <= h + (int32_t)s_coast_dn;
 }
 
+// ---- taps -----------------------------------------------------------------
+// A tap (one edge frame) is a fixed DESK_NUDGE_MM step that ends by itself —
+// and it can only be stopped by tapping the other way, which is a step back.
+// So a tap is judged by where it WILL end, not by how close it is getting:
+// one that stays short of the flap height is left alone, and one that would
+// end past it is not sent at all. Stopping a tap that was never going to reach
+// the flap is what once turned "tap up at 742" into 752 and straight back to
+// 742.
+#define TAP_WINDOW_MS   4000            // the step's ~1 s latency plus its travel
+#define HOLD_AFTER_MS   400             // a held code this soon after = a press
+
+static uint8_t    s_drive_key;          // the recall driving the desk now, 0 = none
+static uint32_t   s_drive_gen;          // announcements before it
+static int32_t    s_tap_from = -1;      // height the last tap started from
+static int8_t     s_tap_dir;
+static TickType_t s_tap_at;
+static TickType_t s_tap_refused_at;     // 0 = none
+
+static int8_t edge_dir(uint8_t k) { return k == KEY_UP_E ? 1 : k == KEY_DOWN_E ? -1 : 0; }
+
+// Track the panel's taps: an edge starts one, anything that moves the desk
+// otherwise (a held code, a recall) ends it.
+static void track_tap(uint8_t panel_code, int32_t mm)
+{
+    if (edge_dir(panel_code)) {
+        s_tap_from = mm;
+        s_tap_dir  = edge_dir(panel_code);
+        s_tap_at   = xTaskGetTickCount();
+    } else if (is_motion(panel_code) || is_recall(panel_code)) {
+        s_tap_from = -1;
+    } else if (s_tap_from >= 0 &&
+               xTaskGetTickCount() - s_tap_at > pdMS_TO_TICKS(TAP_WINDOW_MS)) {
+        s_tap_from = -1;
+    }
+}
+
+// Would a step of DESK_NUDGE_MM from `from` in `dir` end past the flap height?
+static bool tap_crosses(int8_t dir, int32_t from)
+{
+    int32_t h = (int32_t)s_height, end = from + dir * DESK_NUDGE_MM;
+    return dir > 0 ? (from < h && end > h) : (from > h && end < h);
+}
+
+// The move in progress is a tap that ends short of the flap height.
+static bool tap_stays_short(int8_t dir)
+{
+    return s_tap_from >= 0 && dir == s_tap_dir && !tap_crosses(s_tap_dir, s_tap_from);
+}
+
+// The presets are the only settings stored without being asked. s_preset_mm
+// holds what is in flash (loaded once at boot); a recall's announcement is
+// compared with it, and flash is written ONLY when the two differ. Seeing the
+// same height again just confirms it — no write. s_preset_known is a RAM-only
+// "may be trusted for a takeover" flag, cleared when the panel re-saves.
 static void learn(uint8_t key, uint16_t dest)
 {
     int i = slot(key);
-    if (i < 0) return;
-    if (!s_preset_known[i] || s_preset_mm[i] != dest) {
+    if (i < 0 || dest < DESK_MIN_MM || dest > DESK_MAX_MM) return;
+    if (s_preset_mm[i] != dest) {
+        printf("[flap] preset %s: %u -> %u mm — stored\n",
+               i ? "sit" : "stand", s_preset_mm[i], dest);
         s_preset_mm[i] = dest;
-        s_preset_known[i] = true;
         settings_mark_dirty();
-        printf("[flap] learned preset 0x%02X = %u mm\n", key, dest);
+    } else if (!s_preset_known[i]) {
+        printf("[flap] preset %s confirmed at %u mm — unchanged, nothing written\n",
+               i ? "sit" : "stand", dest);
     }
+    s_preset_known[i] = true;
 }
 
 static void begin_stop(int8_t dir, int32_t mm, bool self_driven)
@@ -150,10 +211,12 @@ static void begin_stop(int8_t dir, int32_t mm, bool self_driven)
 
 // ---- the decision ---------------------------------------------------------
 
-uint8_t flap_decide(uint8_t panel_code)
+static uint8_t decide(uint8_t panel_code)
 {
     int32_t mm  = height();
     int8_t  dir = desk_direction();
+
+    track_tap(panel_code, mm);
 
     // End the hands-off window once the resumed move is over.
     if (s_hands_off) {
@@ -194,9 +257,12 @@ uint8_t flap_decide(uint8_t panel_code)
     case ST_PLANNING: {
         // Waiting for the board to announce where the recall is going.
         uint16_t dest;
-        if (!desk_target_mm(&dest) || dest == s_plan_from) {
-            if (xTaskGetTickCount() - s_plan_started > pdMS_TO_TICKS(2500))
+        if (desk_target_gen() == s_plan_gen || !desk_target_mm(&dest) ||
+            dest == s_plan_from) {
+            if (xTaskGetTickCount() - s_plan_started > pdMS_TO_TICKS(2500)) {
                 s_state = ST_PASS;      // no announcement; nothing to plan on
+                trace_add(TR_RECALL, s_job_key, TRR_PLAN_TIMEOUT);
+            }
             return panel_code;
         }
         learn(s_job_key, dest);
@@ -205,10 +271,12 @@ uint8_t flap_decide(uint8_t panel_code)
         uint16_t hi = s_plan_from < dest ? dest : s_plan_from;
         if (s_height <= lo || s_height >= hi) {
             s_state = ST_PASS;
+            trace_add(TR_RECALL, s_job_key, TRR_PLAN_SAFE);
             return panel_code;          // does not cross; leave it alone
         }
 
         // It crosses. Stop it now, while the desk has barely started.
+        trace_add(TR_RECALL, s_job_key, TRR_PLAN_CROSSES);
         s_job_dest    = dest;
         s_job_running = true;
         begin_stop(dest > s_plan_from ? 1 : -1, mm, true);
@@ -262,11 +330,13 @@ uint8_t flap_decide(uint8_t panel_code)
         // is wrong from this frame on. Forget it; the next press re-learns.
         if (panel_code == KEY_SAVE_ST || panel_code == KEY_SAVE_SI) {
             int i = (panel_code == KEY_SAVE_ST) ? 0 : 1;
+            // The board's preset may have moved, so it is no longer trusted
+            // for a takeover — but flash is left alone: the next recall
+            // announces the height, and only a different one is written.
             if (s_preset_known[i]) {
                 s_preset_known[i] = false;
-                s_preset_mm[i]    = 0;
-                settings_mark_dirty();
-                printf("[flap] a preset was re-saved — its height will be re-learned\n");
+                printf("[flap] preset %s re-saved on the panel — checked on its next press\n",
+                       i ? "sit" : "stand");
             }
         }
 
@@ -282,8 +352,15 @@ uint8_t flap_decide(uint8_t panel_code)
         // the flap, and the flap only runs when it is fit to. A board whose
         // encoder is missing, or which is being driven by hand in dev mode,
         // must not stop a move it cannot finish — see mode.h.
-        if (!s_on || s_hands_off || s_job_running || !mode_flap_may_run())
+        if (!s_on || s_hands_off || s_job_running || !mode_flap_may_run()) {
+            if (is_recall(panel_code))
+                trace_add(TR_RECALL, panel_code,
+                          !s_on ? TRR_FLAP_OFF : s_hands_off ? TRR_HANDS_OFF :
+                          s_job_running ? TRR_JOB_RUNNING : TRR_NOT_FIT);
             return panel_code;
+        }
+        if (is_recall(panel_code) && mm < 0)
+            trace_add(TR_RECALL, panel_code, TRR_NO_HEIGHT);
 
         if (is_recall(panel_code) && mm >= 0) {
             uint16_t known;
@@ -301,8 +378,10 @@ uint8_t flap_decide(uint8_t panel_code)
                     s_state       = ST_MOVING;
                     printf("[flap] recall to %u mm crosses %u — taking over before\n"
                            "       the board hears it\n", known, s_height);
+                    trace_add(TR_RECALL, panel_code, TRR_TAKEOVER);
                     return KEY_IDLE;
                 }
+                trace_add(TR_RECALL, panel_code, TRR_SAFE);
                 return panel_code;      // known and harmless
             }
             // First time for this preset: forward it, watch for the
@@ -310,13 +389,51 @@ uint8_t flap_decide(uint8_t panel_code)
             s_job_key      = panel_code;
             s_plan_from    = (uint16_t)mm;
             s_plan_started = xTaskGetTickCount();
+            s_plan_gen     = desk_target_gen();
             s_state        = ST_PLANNING;
+            trace_add(TR_RECALL, panel_code, TRR_PLANNING);
             return panel_code;
         }
 
-        if (s_armed && approaching(dir, mm)) {
+        // A tap the flap would have to stop is never sent: stopping it costs a
+        // step back. Disarmed, so a second tap — someone who means it — goes
+        // through. If the edge was the start of a HOLD, the held codes that
+        // follow re-arm it, and a held move is stopped cleanly, with idle.
+        if (edge_dir(panel_code) && s_armed && mm >= 0 &&
+            tap_crosses(edge_dir(panel_code), mm)) {
+            s_armed          = false;
+            s_tap_from       = -1;
+            s_tap_refused_at = xTaskGetTickCount();
+            printf("[flap] a tap from %ld mm would end past %u — not sent. Tap again to pass.\n",
+                   (long)mm, s_height);
+            return KEY_IDLE;
+        }
+        if (s_tap_refused_at && is_motion(panel_code) && !edge_dir(panel_code) &&
+            xTaskGetTickCount() - s_tap_refused_at < pdMS_TO_TICKS(HOLD_AFTER_MS))
+            s_armed = true;             // it was a press, not a tap
+        if (s_tap_refused_at &&
+            xTaskGetTickCount() - s_tap_refused_at >= pdMS_TO_TICKS(HOLD_AFTER_MS))
+            s_tap_refused_at = 0;
+
+        if (s_armed && approaching(dir, mm) && !tap_stays_short(dir)) {
             printf("[flap] desk approaching %u mm — stopping\n", s_height);
             begin_stop(dir, mm, !is_motion(panel_code));
+            // Nobody is holding a key, so a RECALL is driving this move — one
+            // that slipped past the takeover (hands-off, flap just switched
+            // on, no height at the time). Stopping it and handing the bus back
+            // would leave the desk parked at the flap height for good: make it
+            // a flap job like any other, so the flap runs and the recall is
+            // sent again to finish the move.
+            if (!is_motion(panel_code) && s_drive_key) {
+                uint16_t dest = 0;
+                if (desk_target_gen() == s_drive_gen || !desk_target_mm(&dest))
+                    flap_preset(s_drive_key, &dest);
+                s_job_key     = s_drive_key;
+                s_job_dest    = dest;
+                s_job_running = true;
+                trace_add(TR_RECALL, s_drive_key, TRR_CAUGHT_LATE);
+                printf("[flap] it is a recall to %u mm — the flap, then the recall again\n", dest);
+            }
             if (is_motion(panel_code))
                 return KEY_IDLE;        // a held move stops on idle
             return stop_code(dir);
@@ -324,6 +441,129 @@ uint8_t flap_decide(uint8_t panel_code)
         return panel_code;              // the panel is in charge
     }
 }
+
+// The desk gate, applied to whatever is about to reach the board — the panel's
+// code or our own — so nothing upstream can get round it. A move is refused by
+// sending idle in its place. Not while STOPPING: those frames are the stop, and
+// refusing them would leave a move that is already running to finish.
+static volatile uint32_t s_refused;
+
+// Learning a preset is only watching: the board announces where a recall is
+// going, and that height is the preset. It changes nothing on the bus, so it
+// runs on every recall that reaches the board — whether or not the intercept is
+// on. Tied to the intercept, as it once was, nothing was learned in dev mode,
+// with the flap off, or in the hands-off window after a flap move.
+static uint8_t    s_watch_key;          // 0 = not watching
+static uint16_t   s_watch_from;
+static uint32_t   s_watch_gen;          // announcements before the recall
+static TickType_t s_watch_at;
+
+static void watch_recall(uint8_t sent)
+{
+    if (is_recall(sent)) {
+        s_drive_key = sent;             // the board is now driving to a preset
+        s_drive_gen = desk_target_gen();
+    } else if (is_motion(sent))
+        s_drive_key = 0;                // a key took over; the recall is cancelled
+    if (is_recall(sent)) {
+        int32_t mm = height();
+        if (mm >= 0) {
+            s_watch_key  = sent;
+            s_watch_from = (uint16_t)mm;
+            s_watch_gen  = desk_target_gen();
+            s_watch_at   = xTaskGetTickCount();
+        }
+        return;
+    }
+    if (!s_watch_key)
+        return;
+    uint16_t dest;
+    if (desk_target_gen() != s_watch_gen && desk_target_mm(&dest) &&
+        dest != s_watch_from) {
+        learn(s_watch_key, dest);
+        s_watch_key = 0;
+    } else if (xTaskGetTickCount() - s_watch_at > pdMS_TO_TICKS(2500)) {
+        s_watch_key = 0;                // no announcement: already there
+    }
+}
+
+// 'debug start': everything that steers a move, logged when it changes. Runs
+// once per panel frame, after the decision, so it sees what the board was
+// actually told. Each check is a compare; the event itself is a few stores.
+static void trace_frame(uint8_t panel_code, uint8_t out)
+{
+    static uint8_t  last_panel = 0xFE, last_out = 0xFE;
+    static int32_t  last_state = -1, last_mm = -2, last_target = -1;
+    static int8_t   last_flags[4] = { -1, -1, -1, -1 };
+    static uint32_t last_gen = 0xFFFFFFFFu;
+
+    if (!trace_on()) {
+        last_panel = last_out = 0xFE;   // a fresh 'debug start' logs a snapshot
+        last_state = -1; last_mm = -2; last_target = -1; last_gen = 0xFFFFFFFFu;
+        for (int i = 0; i < 4; i++) last_flags[i] = -1;
+        return;
+    }
+    if (s_state != last_state) {
+        trace_add(TR_STATE, last_state < 0 ? s_state : last_state, s_state);
+        last_state = s_state;
+    }
+    if (panel_code != last_panel) { trace_add(TR_PANEL, panel_code, 0); last_panel = panel_code; }
+    if (out != last_out)          { trace_add(TR_SENT,  out, 0);        last_out   = out; }
+
+    int32_t mm = height();
+    if (mm != last_mm) { trace_add(TR_HEIGHT, mm, desk_direction()); last_mm = mm; }
+
+    uint16_t t;
+    if (desk_target_gen() != last_gen) {    // each announcement, repeats included
+        last_gen = desk_target_gen();
+        int32_t target = desk_target_mm(&t) ? t : 0;
+        if (target != last_target || last_target < 0) trace_add(TR_TARGET, target, 0);
+        last_target = target;
+    }
+
+    int8_t flags[4] = { s_hands_off, s_armed, !mode_desk_may_move(),
+                        s_on && !s_hands_off && !s_job_running && mode_flap_may_run() };
+    for (int i = 0; i < 4; i++)
+        if (flags[i] != last_flags[i]) {
+            trace_add(TR_FLAG, i, flags[i]);
+            last_flags[i] = flags[i];
+        }
+}
+
+// When the desk last did anything: a move key or recall sent, or the height
+// changing. settings.c will not write flash until it has been still for
+// DESK_STILL_MS — flap_busy() alone misses the moves the BOARD drives (a
+// recall passed through, the resumed move after a flap job).
+#define DESK_STILL_MS   3000
+static volatile TickType_t s_active_at;
+static int32_t             s_active_mm = -1;
+
+bool flap_desk_still(void)
+{
+    return s_state == ST_PASS && !s_job_running && desk_direction() == 0 &&
+           xTaskGetTickCount() - s_active_at > pdMS_TO_TICKS(DESK_STILL_MS);
+}
+
+uint8_t flap_decide(uint8_t panel_code)
+{
+    uint8_t out = decide(panel_code);
+    if (s_state != ST_STOPPING && (is_motion(out) || is_recall(out)) &&
+        !mode_desk_may_move()) {
+        s_refused++;
+        led_refused();                  // the person at the panel sees why
+        out = KEY_IDLE;
+    }
+    watch_recall(out);                  // what the board actually hears
+    int32_t mm_now = height();
+    if (is_motion(out) || is_recall(out) || mm_now != s_active_mm) {
+        s_active_at = xTaskGetTickCount();
+        s_active_mm = mm_now;
+    }
+    trace_frame(panel_code, out);
+    return out;
+}
+
+uint32_t flap_refused_moves(void) { return s_refused; }
 
 // ---- settings -------------------------------------------------------------
 
@@ -375,6 +615,12 @@ bool flap_preset(uint8_t key, uint16_t *mm)
     if (i < 0 || !s_preset_known[i]) return false;
     if (mm) *mm = s_preset_mm[i];
     return true;
+}
+
+uint16_t flap_preset_stored(uint8_t key)
+{
+    int i = slot(key);
+    return i < 0 ? 0 : s_preset_mm[i];
 }
 
 bool flap_set_preset(uint8_t key, uint16_t mm)

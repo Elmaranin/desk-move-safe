@@ -101,10 +101,9 @@
 // would take away a feature that works, in exchange for nothing.
 //
 // Set this to 1 when run_flap() drives the stepper for real (step 4). From that
-// moment the boot self-check becomes a gate: no encoder or no stored min/max
-// means the intercept stays OFF and the desk is plain pass-through, which is the
-// correct failure — stopping a move at the flap height and then not moving the
-// flap is worse than never stopping it. See src/mode.h.
+// moment the self-check also gates the flap itself. The desk does not wait for
+// this: no encoder or no stored min/max already locks the desk — every move is
+// refused — because a flap left open is in its path. See src/mode.h.
 #define FLAP_DRIVES_MOTOR   0
 
 // ---- the flap -------------------------------------------------------------
@@ -297,6 +296,25 @@ the pins, or turn the UART back on."
 // loose enough not to trip on sensor noise or a magnet slightly off axis.
 #define POSITION_TOLERANCE_DEG  1.0
 
+// ---- travel limits ---------------------------------------------------------
+// Ported from the bench rig with its values. Once min and max are stored
+// ('lim min' / 'lim max'), the encoder watches every move and hard-stops the
+// motor this far past either end — degrees of the measured shaft. See limits.h.
+#define LIMIT_GUARD_DEG     1.0
+
+// How far the step counter may disagree with the encoder before a move
+// re-seeds it from the absolute angle.
+#define LIMIT_RESYNC_DEG    1.0
+
+// After a targeted move ('mot go') the shaft is crept toward the target under
+// the encoder until it is within this many degrees.
+#define LIMIT_SETTLE_DEG    0.1
+
+// The last stretch of a targeted move is crept under the encoder rather than
+// run open-loop, so the load cannot carry the shaft past an end. The default
+// for a new range; 'eeprom set lim_approach_deg <deg>' stores another.
+#define LIMIT_APPROACH_DEG  4.0
+
 // ---- motor and gearing ----------------------------------------------------
 #define FULL_STEPS_REV      200     // standard 1.8 deg NEMA 17
 
@@ -353,6 +371,15 @@ the pins, or turn the UART back on."
 // Reaching that speed takes v^2/(2a) = ~420 microsteps, a quarter of a motor
 // revolution, so any move longer than half a turn cruises.
 #define DEFAULT_ACCEL_SPS2  30000u
+
+// ---- status LED ------------------------------------------------------------
+// The onboard WS2812 — the Supermini's only LED (../docs/wiring.md). Blinks red
+// when the desk lock refuses a panel press. On its own PIO block: the driver's
+// UART has TMC_UART_PIO.
+#define PIN_LED             16
+#define LED_PIO             pio1
+#define LED_ORDER_GRB       1       // most WS2812s; 0 if "red" comes out green
+#define LED_BRIGHTNESS      40      // of 255 — these are bright at arm's length
 
 // ---- settings in flash ----------------------------------------------------
 // The last flash sector. PICO_BOARD=pico2 assumes 4 MB; if the boot banner

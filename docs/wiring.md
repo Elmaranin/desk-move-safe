@@ -55,7 +55,7 @@ follow the datasheet.
 | GP9, GP10 | — | the driver's UART, if it is ever turned on (below) | no |
 | GP11 | — | the driver's DIAG, or a limit switch | no |
 | GP12–GP15 | — | free | — |
-| GP16 | — | onboard WS2812, status indicator | — |
+| GP16 | — | onboard WS2812: blinks red when the desk lock refuses a panel press (`led.c`, on `pio1`) | yes |
 | GP26 | SPI1 SCK | MT6835 CLK | not yet |
 | GP27 | SPI1 TX | MT6835 MOSI | not yet |
 | GP28 | SPI1 RX | MT6835 MISO | not yet |
@@ -279,6 +279,37 @@ buck's output.
 The desk header's 3.3 V is not a candidate for powering the rig — it is sized
 for a panel with an LCD and a few buttons, and a stepper driver's logic plus an
 encoder on top of it is asking for a brown-out that takes the desk down too.
+
+### Powered from the header's 3.3 V, USB will not enumerate
+
+Observed 2026-10-02 on the dev board, with its `3V3` pin fed from the desk
+header's 3.3 V. **The plugging order decides whether USB works:**
+
+| Order | Result |
+|---|---|
+| desk powered first, then USB plugged in | no tty appears on the Mac |
+| USB first (or desk power removed), then desk | tty appears and keeps working |
+
+The cause is back-powering. 3.3 V fed into the **output** of the module's
+regulator leaks backwards through it: the `5V`/VBUS pin measured **3.3 V
+with no USB attached**. The host then finds voltage on a line only it should
+drive, and does not enumerate. Once the host's 5 V is there first, the leak
+has nothing to push against.
+
+A diode between the header and `3V3` does **not** help — the leak path is
+`3V3` → regulator → VBUS, downstream of it. The fixes are on the VBUS side:
+
+- **Dev:** a USB cable or adapter with VBUS (red) cut. The host detects the
+  device by the D+ pull-up, not VBUS, and the SDK forces VBUS-detect on
+  modules with no sense pin, so data still works.
+- **Board:** a Schottky in the VBUS line, anode at the connector — the
+  Pico's VBUS → VSYS diode. Then any order works.
+- **Plugging USB first** works, but leaves the module's regulator and the
+  desk's fighting over one rail. Bench minutes only.
+
+Under the desk nothing is plugged into USB, so production is unaffected — but
+check the Supermini schematic for a VBUS diode before committing to a harness.
+The concern above still stands: this is the panel's supply.
 
 ## Two RP2350 traps
 
