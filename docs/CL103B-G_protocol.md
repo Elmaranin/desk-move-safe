@@ -34,6 +34,13 @@ capture. Everything here was confirmed empirically during analysis, not assumed.
   debugger drives it.
 - The `3.3V RX TX GND` header is the panel UART used throughout this document.
 
+### ⚠️ The board's power output is switched off while the desk moves
+
+Measured 2026-10-02: the controller board's power output port loses its voltage
+for as long as the desk's motors run, and gets it back when they stop. It is not
+a tap on the supply input. Anything that has to work *during* a move must not
+be powered from it — see [wiring.md](wiring.md#power).
+
 ### ⚠️ The panel header's RX and TX labels are SWAPPED
 
 Photographed on the panel PCB of this desk (`docs/desk/2026-09-22 10-57-31.JPG`):

@@ -110,13 +110,15 @@ static void print(const ev_t *e)
         case TRJ_TAKE:       printf("job    flap takeover, destination %ld mm\n", (long)e->b); break;
         case TRJ_GO:         printf("job    'go' to %ld mm\n", (long)e->b); break;
         case TRJ_AT_FLAP:    printf("job    %s\n", e->b ? "at the flap height" : "did NOT reach the flap height"); break;
-        case TRJ_FLAP_START: printf("job    flap running\n"); break;
-        case TRJ_FLAP_END:   printf("job    flap done\n"); break;
+        case TRJ_FLAP_START: printf("job    flap moving to %s\n", e->b ? "COLLAPSED" : "EXPANDED"); break;
+        case TRJ_FLAP_END:   printf("job    flap %s\n", e->b ? "there" : "move FAILED — the desk stays put"); break;
         case TRJ_RESUME:     printf("job    resume: re-sending %s once\n", key_name(e->b)); break;
         case TRJ_SENT:       printf("job    %s\n", e->b ? "recall went out on the wire"
                                                          : "recall NEVER went out (panel quiet)"); break;
         case TRJ_ABORTED:    printf("job    aborted ('stop')\n"); break;
         case TRJ_DONE:       printf("job    done — bus handed back to the panel\n"); break;
+        case TRJ_SWAP:       printf("job    manual crossing — flap to %s, no recall\n",
+                                    e->b ? "COLLAPSED" : "EXPANDED"); break;
         default:             printf("job    phase %ld\n", (long)e->a); break;
         }
         break;

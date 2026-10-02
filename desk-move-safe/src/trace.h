@@ -60,6 +60,7 @@ enum {
     TRJ_SENT,       // b = 1 left on the wire, 0 timed out
     TRJ_ABORTED,
     TRJ_DONE,
+    TRJ_SWAP,       // a manual crossing: b = 1 collapsing, 0 expanding
 };
 
 void trace_set(bool on);

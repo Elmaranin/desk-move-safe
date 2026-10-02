@@ -31,8 +31,8 @@ static double get_flap_on(void)   { return flap_enabled() ? 1 : 0; }
 
 static double get_version(void)   { return settings()->version; }
 static double get_flags(void)     { return settings()->lim.flags; }
-static double get_min_raw(void)   { return settings()->lim.min_raw; }
-static double get_max_raw(void)   { return settings()->lim.max_raw; }
+static double get_expanded_raw(void)   { return settings()->lim.expanded_raw; }
+static double get_collapsed_raw(void)   { return settings()->lim.collapsed_raw; }
 static double get_enc_span(void)  { return settings()->lim.enc_span; }
 static double get_span(void)      { return settings()->lim.span_steps; }
 static double get_spr(void)       { return settings()->lim.steps_per_rev; }
@@ -105,6 +105,24 @@ static bool set_speed(double v)
     return true;
 }
 
+static double get_early(void) { return flap_early_start() ? 1 : 0; }
+static bool set_early(double v)
+{
+    if (v != 0 && v != 1) { printf("rejected: 0 or 1\n"); return false; }
+    flap_set_early_start(v != 0);
+    settings_mark_dirty();
+    return true;
+}
+
+static double get_resume(void) { return flap_early_resume() ? 1 : 0; }
+static bool set_resume(double v)
+{
+    if (v != 0 && v != 1) { printf("rejected: 0 or 1\n"); return false; }
+    flap_set_early_resume(v != 0);
+    settings_mark_dirty();
+    return true;
+}
+
 static bool set_backlash(double v) { return limits_set_play((int32_t)v); }
 static bool set_approach(double v) { return limits_set_approach(v); }
 
@@ -130,17 +148,19 @@ static const param_t P[] = {
     { "desk_coast_down_mm", "mm",        0, false, get_coast_dn, set_coast_dn, NULL },
     { "desk_flap_mm",       "mm",        0, false, get_flap_mm,  set_flap_mm,  NULL },
     { "desk_flap_on",       "0|1",       0, false, get_flap_on,  set_flap_on,  NULL },
+    { "desk_early_resume",  "0|1",       0, true,  get_resume,   set_resume,   NULL },
 
-    { "lim_flags",          "bits",      0, true,  get_flags,    NULL,         "'lim min', 'lim max', 'reset'" },
-    { "lim_min_raw",        "raw",       0, true,  get_min_raw,  NULL,         "'lim min'; 'reset' clears it" },
-    { "lim_max_raw",        "raw",       0, true,  get_max_raw,  NULL,         "'lim max'; 'reset' clears it" },
-    { "lim_enc_span",       "counts",    0, true,  get_enc_span, NULL,         "'lim max'; 'reset' clears it" },
-    { "lim_span_steps",     "microsteps",0, true,  get_span,     NULL,         "'lim max', 'lim span'; 'reset' clears it" },
+    { "lim_flags",          "bits",      0, true,  get_flags,    NULL,         "'lim expanded', 'lim collapsed', 'reset'" },
+    { "lim_expanded_raw",        "raw",       0, true,  get_expanded_raw,  NULL,         "'lim expanded'; 'reset' clears it" },
+    { "lim_collapsed_raw",        "raw",       0, true,  get_collapsed_raw,  NULL,         "'lim collapsed'; 'reset' clears it" },
+    { "lim_enc_span",       "counts",    0, true,  get_enc_span, NULL,         "'lim collapsed'; 'reset' clears it" },
+    { "lim_span_steps",     "microsteps",0, true,  get_span,     NULL,         "'lim collapsed', 'lim span'; 'reset' clears it" },
     { "lim_steps_per_rev",  "microsteps",0, true,  get_spr,      NULL,         "the firmware, when the range is stored" },
     { "lim_backlash",       "microsteps",0, true,  get_backlash, set_backlash, NULL },
     { "lim_approach_deg",   "deg",       1, true,  get_approach, set_approach, NULL },
 
     { "mot_speed_sps",      "steps/s",   0, true,  get_speed,    set_speed,    NULL },
+    { "mot_early_start",    "0|1",       0, true,  get_early,    set_early,    NULL },
 };
 #define N_PARAMS (sizeof P / sizeof P[0])
 
@@ -159,8 +179,8 @@ static void line(const param_t *p)
     if (!strcmp(p->unit, "raw"))
         printf(" (%.3f deg)", v * 360.0 / ENCODER_CPR);
     else if (!strcmp(p->name, "lim_flags"))
-        printf(" (%s, %s)", (unsigned)v & 1u ? "min stored" : "min missing",
-               (unsigned)v & 2u ? "max stored" : "max missing");
+        printf(" (%s, %s)", (unsigned)v & 1u ? "expanded stored" : "expanded missing",
+               (unsigned)v & 2u ? "collapsed stored" : "collapsed missing");
     else if (strstr(p->name, "panel_") == p->name && v == 0)
         printf(" (not known yet)");
     if (!p->set)

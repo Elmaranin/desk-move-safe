@@ -44,9 +44,10 @@ static void help(void)
     printf(
         "\n"
         "  status              everything at a glance: self-check, desk, motor\n"
-        "  init                calibrate the flap, step by step — always available\n"
-        "  done                (init) store the position the flap is at now\n"
-        "  abort               (init) leave init; the desk stays locked\n"
+        "  calibrate           store the flap's two ends, step by step — always available\n"
+        "  done                (calibrate) store the position the flap is at now\n"
+        "  abort               (calibrate) stop calibrating; the desk stays locked\n"
+        "  reset               clear the flap calibration: motor and DESK locked\n"
         "  stop                stop whatever the firmware is driving, now\n"
         "  dev                 working or dev mode, and the boot self-check\n"
         "  dev start|stop      unlock the development commands, or lock them\n"
@@ -63,20 +64,19 @@ static void help(void)
         "\n"
         "  --- development only: 'dev start' first ---\n"
         "  go <cm>             drive the desk directly, bypassing the panel\n"
-        "  reset               clear the flap calibration: motor and DESK locked\n"
         "\n"
-        "  lim min             store the shaft's position as min\n"
-        "  lim max             store it as max (same session as min)\n"
+        "  lim expanded        store where the flap is now as its EXPANDED end\n"
+        "  lim collapsed       store it as its COLLAPSED end (same session)\n"
         "  lim play [<deg>]    measure the gearbox backlash (before the ends)\n"
         "  lim span [<n>]      re-measure the steps between the ends, or set them\n"
         "  lim sync            re-seed the step counter from the encoder\n"
-        "  lim free            toggle: ignore the range until reset — careful\n"
+        "  lim free            toggle: ignore the range until reboot — careful\n"
         "\n"
         "  mot                 the flap motor: what it is doing and how it is set\n"
         "  mot on|off          energise the coils, or release them\n"
         "  mot accel <sps2>    ramp rate, microsteps/s^2\n"
         "  mot jog <steps>     small move, max one motor turn — works with no range\n"
-        "  mot go min|max|<n>  to an end, or n steps from min, then settle\n"
+        "  mot go expanded|collapsed|<n>   to an end, or n steps from expanded\n"
         "  mot move <steps>    signed microsteps, inside the range\n"
         "  mot rev <revs>      signed revolutions OF THE FLAP SHAFT (%g:1 box)\n"
         "  mot run fwd|back    to the end of travel that way\n"
@@ -128,8 +128,9 @@ static void desk_status(void)
     printf("doing     %s\n", flap_state_str());
 
     cm(flap_height(), buf, sizeof buf);
-    printf("flap      %-3s at %u mm (%s)\n", flap_enabled() ? "ON" : "off",
-           flap_height(), buf);
+    printf("flap      %-3s at %u mm (%s) | %lu unsafe crossings refused\n",
+           flap_enabled() ? "ON" : "off", flap_height(), buf,
+           (unsigned long)flap_refused_crossings());
 
     cm(flap_ceiling_mm(), buf, sizeof buf);
     printf("ceiling   %-3s at %u mm (%s) | %lu UPs refused\n",
@@ -189,7 +190,7 @@ static void enc_status(void)
                "          CRC of that is not 0xFF — so this is a definite no,\n"
                "          not a maybe. Check CS=GP%d SCK=GP%d MOSI=GP%d\n"
                "          MISO=GP%d, 3V3 and a shared ground. The task retries\n"
-               "          every second, so fixing a lead needs no reset.\n"
+               "          every second, so fixing a lead needs no reboot.\n"
                "          %lu frames have failed their CRC so far.\n",
                MT6835_PIN_CS, MT6835_PIN_SCK, MT6835_PIN_MOSI, MT6835_PIN_MISO,
                (unsigned long)encoder_errors());
@@ -358,7 +359,7 @@ static void enc(char *arg)
             if (g <= 0.0) { printf("usage: enc gear <ratio>, e.g. 'enc gear 17.23'\n"); return; }
             encoder_set_gear(g);
             printf("session only — board_config.h's GEAR_RATIO returns at the\n"
-                   "next reset.\n");
+                   "next reboot.\n");
         }
         printf("gear %.4g:1 | %.0f sensor counts per motor revolution\n",
                encoder_gear(), (double)ENCODER_CPR / encoder_gear());
@@ -493,11 +494,11 @@ static void mot(char *arg)
 
     } else if (!strcmp(arg, "go")) {
         bool ok;
-        if (v && !strcmp(v, "min"))      ok = limits_goto_end(false);
-        else if (v && !strcmp(v, "max")) ok = limits_goto_end(true);
+        if (v && !strcmp(v, "expanded"))      ok = limits_goto_end(false);
+        else if (v && !strcmp(v, "collapsed")) ok = limits_goto_end(true);
         else if (v)                      ok = limits_goto((int32_t)strtol(v, NULL, 10));
         else {
-            printf("usage: mot go min | mot go max | mot go <steps from min, 0..%ld>\n",
+            printf("usage: mot go expanded | mot go collapsed | mot go <steps from expanded, 0..%ld>\n",
                    (long)limits_span_steps());
             return;
         }
@@ -733,7 +734,7 @@ static void tmc(char *arg)
 // figures, 'stop' — stays. What is behind the gate is everything that drives
 // something directly or pokes at a register, because none of that has any
 // business happening because of a mistyped line on a desk in use.
-// ---- init: guided calibration ---------------------------------------------
+// ---- calibrate: guided calibration ----------------------------------------
 //
 // Always available, working mode included: a board without its calibration
 // has a locked desk, and whoever is in front of it must be able to fix that
@@ -748,29 +749,29 @@ static void tmc(char *arg)
 // jog. Turning the flap by hand does NOT work: the steps between the ends are
 // counted from the motor's own moves, and a hand-turned end has none.
 
-typedef enum { INIT_OFF, INIT_MIN, INIT_MAX } init_t;
-static init_t s_init;
-static char   s_repeat[LINE_MAX];       // the last 'mot jog' typed during init
+typedef enum { CAL_OFF, CAL_EXPANDED, CAL_COLLAPSED } cal_t;
+static cal_t s_cal;
+static char   s_repeat[LINE_MAX];       // the last 'mot jog' typed during calibration
 
 static const char *prompt(void)
 {
-    return s_init == INIT_MIN ? "init min> " : s_init == INIT_MAX ? "init max> " : "> ";
+    return s_cal == CAL_EXPANDED ? "calibrate expanded> " : s_cal == CAL_COLLAPSED ? "calibrate collapsed> " : "> ";
 }
 
-static void init_ask(void)
+static void cal_ask(void)
 {
-    printf("\nINIT %s — move the flap to its %s with the motor:\n"
+    printf("\nCALIBRATE %s — move the flap to its %s with the motor:\n"
            "  mot jog <steps>   signed, at most %lu per command; Enter repeats it\n"
            "  enc               where the shaft is\n"
            "  done              store this position\n"
-           "  abort             leave init (the desk stays locked)\n",
-           s_init == INIT_MIN ? "1/2" : "2/2",
-           s_init == INIT_MIN ? "MIN position (one end of its travel)"
-                              : "MAX position (the other end)",
+           "  abort             stop calibrating (the desk stays locked)\n",
+           s_cal == CAL_EXPANDED ? "1/2" : "2/2",
+           s_cal == CAL_EXPANDED ? "EXPANDED position"
+                              : "COLLAPSED position",
            (unsigned long)stepper_steps_per_rev());
 }
 
-static void init_start(void)
+static void cal_start(void)
 {
     if (flap_busy()) {
         printf("not now — the desk is mid-sequence (%s). 'stop' first.\n",
@@ -779,62 +780,62 @@ static void init_start(void)
     }
     if (stepper_busy()) { printf("the motor is moving — 'stop' first\n"); return; }
     if (!encoder_available()) {
-        printf("init needs the MT6835 and it is not answering. Nothing was\n"
+        printf("calibrate needs the MT6835 and it is not answering. Nothing was\n"
                "cleared. 'dev start' then 'enc' says what to check.\n");
         return;
     }
     if (!limits_clear())                // prints what it cleared and kept
         return;
     s_repeat[0] = '\0';
-    s_init = INIT_MIN;
+    s_cal = CAL_EXPANDED;
     stepper_enable(true);               // hold the flap where the jogs leave it
-    init_ask();
+    cal_ask();
 }
 
-static void init_done(void)
+static void cal_done(void)
 {
     if (stepper_busy()) { printf("still moving — wait for it, then 'done'\n"); return; }
-    if (s_init == INIT_MIN) {
+    if (s_cal == CAL_EXPANDED) {
         if (!limits_mark(false))
             return;                     // limits.c has said why; still at min
-        s_init = INIT_MAX;
-        init_ask();
+        s_cal = CAL_COLLAPSED;
+        cal_ask();
         return;
     }
     limits_mark(true);
     if (!limits_calibrated()) {
         // limits.c has kept only one end; the clean retry is from the top.
         limits_clear();
-        s_init = INIT_MIN;
-        printf("that did not make a usable range — starting again from min.\n");
-        init_ask();
+        s_cal = CAL_EXPANDED;
+        printf("that did not make a usable range — starting again from expanded.\n");
+        cal_ask();
         return;
     }
-    s_init = INIT_OFF;
-    printf("\nINIT COMPLETE — the desk is unlocked. Stored:\n");
-    params_print("lim_min_raw");
-    params_print("lim_max_raw");
+    s_cal = CAL_OFF;
+    printf("\nCALIBRATION COMPLETE — the desk is unlocked. Stored:\n");
+    params_print("lim_expanded_raw");
+    params_print("lim_collapsed_raw");
     params_print("lim_enc_span");
     params_print("lim_span_steps");
     printf("written to flash in a couple of seconds.\n");
 }
 
-static void init_abort(void)
+static void cal_abort(void)
 {
-    s_init = INIT_OFF;
+    s_cal = CAL_OFF;
     stepper_stop();
-    printf("init aborted — the flap is NOT calibrated, so the DESK stays locked.\n"
-           "'init' starts again.\n");
+    printf("calibration aborted — the flap is NOT calibrated, so the DESK stays locked.\n"
+           "'calibrate' starts again.\n");
 }
 
 static bool unlocked(const char *cmd)
 {
     if (mode_dev())
         return true;
-    if (s_init && (!strcmp(cmd, "mot") || !strcmp(cmd, "enc")))
-        return true;                    // positioning the flap for init
+    if (s_cal && (!strcmp(cmd, "mot") || !strcmp(cmd, "enc")))
+        return true;                    // positioning the flap for calibration
     printf("'%s' is a development command and this board is in working mode.\n"
-           "'dev start' unlocks it. It relocks at the next reset — there is no\n"
+           "'dev start' unlocks it. It relocks at the next reboot — there is no\n"
            "stored mode, so a production board always comes up working.\n", cmd);
     return false;
 }
@@ -859,8 +860,8 @@ static void lim(char *arg)
     if (!unlocked("lim")) return;
     char *v = strtok(NULL, " \t");
 
-    if (!strcmp(arg, "min"))        limits_mark(false);
-    else if (!strcmp(arg, "max"))   limits_mark(true);
+    if (!strcmp(arg, "expanded"))        limits_mark(false);
+    else if (!strcmp(arg, "collapsed"))   limits_mark(true);
     else if (!strcmp(arg, "sync"))  limits_sync(true);
     else if (!strcmp(arg, "free"))  limits_set_free(limits_mode() != LIM_FREE);
     else if (!strcmp(arg, "span")) {
@@ -869,7 +870,7 @@ static void lim(char *arg)
     } else if (!strcmp(arg, "play")) {
         limits_measure_play(v ? strtod(v, NULL) : 1.0);
     } else {
-        printf("usage: lim [min | max | play [deg] | span [n] | sync | free]\n");
+        printf("usage: lim [expanded | collapsed | play [deg] | span [n] | sync | free]\n");
     }
 }
 
@@ -908,8 +909,8 @@ static void eeprom(char *arg)
 
 static void dispatch(char *line)
 {
-    // Remember a jog typed during init before strtok cuts the line up.
-    if (s_init && !strncmp(line, "mot jog ", 8))
+    // Remember a jog typed during calibration before strtok cuts the line up.
+    if (s_cal && !strncmp(line, "mot jog ", 8))
         snprintf(s_repeat, sizeof s_repeat, "%s", line);
 
     char *cmd = strtok(line, " \t");
@@ -919,16 +920,16 @@ static void dispatch(char *line)
     if (!strcmp(cmd, "?")) {
         help();
 
-    } else if (!strcmp(cmd, "init")) {
-        init_start();
+    } else if (!strcmp(cmd, "calibrate")) {
+        cal_start();
 
     } else if (!strcmp(cmd, "done")) {
-        if (s_init) init_done();
-        else        printf("'done' answers 'init' — nothing is waiting for it\n");
+        if (s_cal) cal_done();
+        else        printf("'done' answers 'calibrate' — nothing is waiting for it\n");
 
     } else if (!strcmp(cmd, "abort")) {
-        if (s_init) init_abort();
-        else        printf("'abort' leaves 'init' — which is not running\n");
+        if (s_cal) cal_abort();
+        else        printf("'abort' leaves 'calibrate' — which is not running\n");
 
     } else if (!strcmp(cmd, "status")) {
         status();
@@ -970,14 +971,24 @@ static void dispatch(char *line)
             printf("refused: DESK LOCKED — %s. 'lim' for how.\n", mode_desk_blocked_by());
             return;
         }
+        // 'go' drives the desk and nothing else: it does not move the flap.
+        uint16_t now_mm; uint32_t age;
+        if (FLAP_DRIVES_MOTOR && desk_height_mm(&now_mm, &age) &&
+            mm > flap_height() && mm > now_mm && !limits_at_end(true)) {
+            printf("refused: going up to %u mm, above the flap height (%u), with the\n"
+                   "flap not collapsed — 'mot go collapsed' first.\n", mm, flap_height());
+            return;
+        }
         if (!flap_go(mm)) { printf("busy: %s\n", flap_state_str()); return; }
 
     } else if (!strcmp(cmd, "reset")) {
-        if (!unlocked(cmd)) return;
+        // Always available, like 'calibrate': it only ever makes the board
+        // more cautious (the desk locks), and whoever is at the desk must be
+        // able to start over without knowing about dev mode.
         // Only what the lock depends on. Presets, coast, the flap height,
         // backlash and approach are kept — 'eeprom set' changes those.
         if (limits_clear())
-            printf("'init' calibrates it again.\n");
+            printf("'calibrate' calibrates it again.\n");
 
     } else if (!strcmp(cmd, "mot")) {
         if (!unlocked(cmd)) return;
@@ -1015,7 +1026,7 @@ void console_task(void *arg)
             printf("\n=== desk-move-safe ===\n");
             status();
             if (!limits_calibrated())
-                printf("The flap is not calibrated — type 'init' to do it.\n");
+                printf("The flap is not calibrated — type 'calibrate' to do it.\n");
             printf("'?' for commands.\n%s", prompt());
             last_greet = now ? now : 1;
             greets++;
@@ -1034,7 +1045,7 @@ void console_task(void *arg)
         spoken_to = true;
 
         // CRLF is one Enter, not two: otherwise the \n after a line would be
-        // an empty line, and during init an empty line repeats the last jog.
+        // an empty line, and during calibration an empty line repeats the last jog.
         bool lf_of_crlf = (c == '\n' && prev == '\r');
         prev = c;
         if (lf_of_crlf)
@@ -1045,7 +1056,7 @@ void console_task(void *arg)
             line[len] = '\0';
             if (len) {
                 dispatch(line);
-            } else if (s_init && s_repeat[0]) {
+            } else if (s_cal && s_repeat[0]) {
                 snprintf(line, sizeof line, "%s", s_repeat);
                 printf("%s\n", line);
                 dispatch(line);

@@ -42,17 +42,44 @@ uint8_t flap_decide(uint8_t panel_code);
 // Moves refused because mode_desk_may_move() said no. See mode.h.
 uint32_t flap_refused_moves(void);
 
+// Keys refused by the crossing guard: up past the flap height with the flap
+// not collapsed, when nothing else was going to move the flap first.
+uint32_t flap_refused_crossings(void);
+
 // Handed to flap_task: stop the desk at the flap height, run the flap, then
 // finish the move by re-issuing this recall.
 bool flap_job_take(uint8_t *preset_key, uint16_t *destination_mm);
+
+// A job key that is not a recall: a MANUAL crossing (a held key, or a tap).
+// The flap is moved to the end for the side the desk is heading to — the
+// destination is one millimetre past the flap height on that side — and the
+// bus goes back to the panel; there is no recall to send again.
+#define FLAP_JOB_SWAP   0xF1u
 void flap_job_done(void);
 
 // Hand flap_task a plain move to `mm` — the console's 'go'. The job's key is
 // 0: no flap, no recall afterwards. False if the bus is already taken.
 bool flap_go(uint16_t mm);
 
+// mot_early_start: start the flap the moment the desk is told to stop (true)
+// or once it has stopped at the flap height (false). Stored.
+void flap_set_early_start(bool on);
+bool flap_early_start(void);
+
+// desk_early_resume: re-send the recall once the flap's fast part is over and
+// the encoder puts it within reach of its end (true), or only once the flap
+// has settled on its end (false). Stored.
+void flap_set_early_resume(bool on);
+bool flap_early_resume(void);
+
 const char *flap_state_str(void);
 bool        flap_busy(void);
+
+// For flap_task: is flap.c still bringing the desk to a stop for the job it
+// handed over, and is that job still on (false if the desk could not be
+// stopped)?
+bool        flap_desk_stopping(void);
+bool        flap_job_active(void);
 
 // The desk is at rest: nothing driving it, the height unchanged and no move
 // key sent for a few seconds — whoever started the move, us or the board.

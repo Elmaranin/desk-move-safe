@@ -31,7 +31,7 @@ void mode_check(selfcheck_t *c)
     // THE ENCODER. A real question now: encoder_task answers the sensor on SPI
     // and keeps retrying, so this is "has it ever replied with a frame whose CRC
     // checked". Transiently FAIL for the first few milliseconds after a reset,
-    // which is harmless — nothing gates on it until FLAP_DRIVES_MOTOR.
+    // which locks the desk for those few milliseconds — harmless.
     c->encoder = encoder_available() ? CHK_OK : CHK_FAIL;
 
     // THE TRAVEL LIMITS. Both ends stored in the settings record.
@@ -54,17 +54,15 @@ const char *mode_desk_blocked_by(void)
     selfcheck_t c;
     mode_check(&c);
     if (c.encoder == CHK_FAIL) return "the MT6835 does not answer — the flap cannot be seen";
-    if (c.limits  == CHK_FAIL) return "the flap's min and max are not stored";
+    if (c.limits  == CHK_FAIL) return "the flap's expanded and collapsed ends are not stored";
     return "";
 }
 
 // What the flap has to be fit FOR depends on what it actually does.
 //
-// While run_flap() is a two-second dwell it touches no motor, so neither the
-// encoder nor the travel limits are preconditions for it — and refusing to stop
-// the desk because of them would remove a feature that works today in exchange
-// for nothing. FLAP_DRIVES_MOTOR turns them into hard requirements at the same
-// moment they start to matter.
+// The flap move drives the stepper to an end (FLAP_DRIVES_MOTOR 1), so the driver,
+// the encoder and the stored ends are all preconditions. With FLAP_DRIVES_MOTOR
+// 0 the flap is a dwell that touches no motor, and only dev mode stops it.
 bool mode_flap_may_run(void)
 {
     if (s_dev)
@@ -95,8 +93,7 @@ const char *mode_flap_blocked_by(void)
     mode_check(&c);
     if (c.driver  == CHK_FAIL) return "the stepper driver does not answer";
     if (c.encoder == CHK_FAIL) return "the MT6835 does not answer";
-    if (c.limits  == CHK_FAIL) return "min and max are not stored — 'lim min' "
-                                      "and 'lim max' in dev mode";
+    if (c.limits  == CHK_FAIL) return "the flap's ends are not stored — 'calibrate' calibrates them";
     return "";
 }
 
@@ -127,7 +124,7 @@ void mode_report(void)
     if (*desk)
         printf("          DESK LOCKED: %s.\n"
                "          Every move is refused, panel included (%lu so far).\n"
-               "          'init' calibrates the flap.\n",
+               "          'calibrate' calibrates the flap.\n",
                desk, (unsigned long)flap_refused_moves());
 
     const char *why = mode_flap_blocked_by();
@@ -154,12 +151,12 @@ bool mode_set_dev(bool on)
         s_dev = true;
         printf("\n*** DEV MODE ***\n"
                "The motor commands are unlocked. They go through the travel\n"
-               "limits: with min and max stored they cannot leave the range;\n"
+               "limits: with expanded and collapsed stored they cannot leave the range;\n"
                "without them only 'mot jog' moves, one motor turn at most.\n"
                "'lim free' lifts that for the session — then nothing does.\n"
                "\n"
                "The flap intercept is suspended while this lasts, so the desk is\n"
-               "plain pass-through. 'dev stop', or any reset, returns to working\n"
+               "plain pass-through. 'dev stop', or any reboot, returns to working\n"
                "mode.\n");
         return true;
     }

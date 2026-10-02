@@ -95,16 +95,13 @@
 #define DESK_CEILING_ON         1
 
 // ---- what the flap actually does ------------------------------------------
-// run_flap() in flap_task.c is a two-second dwell today. While that is true the
-// flap touches no motor, so the encoder and the stored travel limits are not
-// preconditions for it — and refusing to stop the desk because they are missing
-// would take away a feature that works, in exchange for nothing.
-//
-// Set this to 1 when run_flap() drives the stepper for real (step 4). From that
-// moment the self-check also gates the flap itself. The desk does not wait for
-// this: no encoder or no stored min/max already locks the desk — every move is
-// refused — because a flap left open is in its path. See src/mode.h.
-#define FLAP_DRIVES_MOTOR   0
+// flap_start()/flap_finish() in flap_task.c drive the stepper: to COLLAPSED when the desk is
+// going up past the flap height, to EXPANDED when it is going down. With this
+// at 1 the self-check gates the flap itself as well as the desk: a driver that
+// does not answer (UART builds only), no encoder, or no stored ends, and the
+// flap does not run. 0 brings back the old two-second dwell that touches no
+// motor — for bench work on the desk side alone.
+#define FLAP_DRIVES_MOTOR   1
 
 // ---- the flap -------------------------------------------------------------
 // The height the desk is stopped at so the flap can move. A preset recall that
@@ -112,6 +109,13 @@
 // is already known, so nothing starts moving and there is nothing to abort.
 #define FLAP_HEIGHT_MM          770
 #define FLAP_ON                 1
+
+// The flap height is not a knife edge: it is chosen with room to spare, and
+// anywhere within this of it the flap may be moved either way. So a desk that
+// landed a few millimetres past the mark is still "at the flap height": a
+// press there moves the flap (or retries a failed move) instead of being
+// refused. Beyond it on the upper side, an uncollapsed flap means no more UP.
+#define FLAP_SAFE_GAP_MM        20
 
 // Once stopped for the flap, do not fire again until the desk has left this
 // band — otherwise a desk resting on the mark re-triggers on every press.
@@ -123,8 +127,19 @@
 #define FLAP_SETTLE_MS          700
 #define FLAP_FRESH_MS           350     // a height older than this is not evidence
 
-// How long the flap takes. A dwell until the stepper is wired — flap.c is the
-// one place that changes.
+// When the flap starts moving — the DEFAULT for the stored parameter
+// mot_early_start ('eeprom set mot_early_start 0|1').
+// 0: once the desk has stopped at the flap height.
+// 1: the moment the desk is told to stop, overlapping its coast (~1 s saved).
+// 1 needs the driver on a supply that stays on while the desk moves: the
+// controller board's power output is CUT during a move (measured 2026-10-02),
+// which stalled the motor. See ../docs/wiring.md, Power.
+#define FLAP_START_WITH_STOP    0
+
+// The flap move gives up after this — the travel is ~3 s at the default
+// speed, so this is a jam, not a slow motor. With FLAP_DRIVES_MOTOR 0, the
+// dwell that stands in for the move.
+#define FLAP_MOVE_TIMEOUT_MS    20000
 #define FLAP_MOVE_MS            2000
 
 // Stopping a move the BOARD is driving needs a key press injected; idle does

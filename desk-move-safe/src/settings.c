@@ -16,12 +16,15 @@
 
 // Bump on any layout change: nvs rejects a record of the wrong length, so an
 // older one reads as "nothing stored" rather than as garbage.
-#define SETTINGS_VERSION    2
+#define SETTINGS_VERSION    4
 
-// Version 1 was everything before `mot`. Read as such, it keeps its values and
-// the new fields take their defaults — a firmware update must not throw away
-// the flap calibration, which would lock the desk until 'init' is run again.
+// Older layouts are this one, truncated: version 1 ended before `mot`, version
+// 2 before mot.early_start, version 3 before desk_early_resume. Read as such, a record keeps its values and the new
+// fields take their defaults — a firmware update must not throw away the flap
+// calibration, which would lock the desk until 'calibrate' is run again.
 #define SETTINGS_V1_SIZE    offsetof(settings_t, mot)
+#define SETTINGS_V2_SIZE    offsetof(settings_t, mot.early_start)
+#define SETTINGS_V3_SIZE    offsetof(settings_t, desk_early_resume)
 
 static settings_t          s_live;
 static volatile bool       s_dirty;
@@ -39,7 +42,9 @@ static void gather(void)
     flap_coast(&s_live.desk.coast_up_mm, &s_live.desk.coast_down_mm);
     s_live.desk.flap_mm = flap_height();
     s_live.desk.flap_on = flap_enabled() ? 1 : 0;
-    s_live.mot.speed_sps = stepper_speed();
+    s_live.mot.speed_sps   = stepper_speed();
+    s_live.mot.early_start = flap_early_start() ? 1 : 0;
+    s_live.desk_early_resume = flap_early_resume() ? 1 : 0;
 }
 
 static void apply(void)
@@ -50,6 +55,8 @@ static void apply(void)
     flap_set_height(s_live.desk.flap_mm);
     flap_set_enabled(s_live.desk.flap_on != 0);
     if (s_live.mot.speed_sps) stepper_set_speed(s_live.mot.speed_sps);
+    flap_set_early_start(s_live.mot.early_start != 0);
+    flap_set_early_resume(s_live.desk_early_resume != 0);
 }
 
 void settings_load(void)
@@ -64,8 +71,14 @@ void settings_load(void)
         apply();
         return;
     }
-    if (nvs_read(&s, SETTINGS_V1_SIZE) && s.version == 1) {
-        memcpy(&s_live, &s, SETTINGS_V1_SIZE);  // mot stays zero: defaults
+    size_t old = 0;
+    if (nvs_read(&s, SETTINGS_V3_SIZE) && s.version == 3)      old = SETTINGS_V3_SIZE;
+    else if (nvs_read(&s, SETTINGS_V2_SIZE) && s.version == 2) old = SETTINGS_V2_SIZE;
+    else if (nvs_read(&s, SETTINGS_V1_SIZE) && s.version == 1) old = SETTINGS_V1_SIZE;
+    if (old) {
+        memcpy(&s_live, &s, old);               // the rest stays zero: defaults
+        if (old < SETTINGS_V3_SIZE)
+            s_live.mot.early_start = FLAP_START_WITH_STOP;
         s_live.version = SETTINGS_VERSION;
         s_stored = true;
         apply();

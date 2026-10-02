@@ -52,7 +52,7 @@ typedef struct {
 void mode_check(selfcheck_t *out);
 
 // May the flap take the bus and run? Working mode, not dev, and no check that
-// matters for what run_flap() actually does has FAILed.
+// matters for what the flap move actually does has FAILed.
 bool mode_flap_may_run(void);
 
 // One line saying why not, for the console and the boot log. Empty if it may.

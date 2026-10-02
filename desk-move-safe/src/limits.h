@@ -46,7 +46,18 @@ bool limits_jog(int32_t steps);         // the one move allowed while LOCKED
 
 // Absolute moves along the range: 0 is min, limits_span_steps() is max.
 bool    limits_goto(int32_t axis_steps);
-bool    limits_goto_end(bool to_max);
+bool    limits_goto_end(bool to_max);       // false: expanded, true: collapsed
+
+// Is the shaft within max_deg of the last targeted move's target, by the
+// encoder? False with no target, no range or no encoder.
+bool    limits_near_target(double max_deg);
+
+// Is the flap at that end now, by the encoder, to within a few degrees?
+// False if it cannot be told (no range, no encoder).
+bool    limits_at_end(bool collapsed);
+
+// Which end the flap is nearer now: 0 expanded, 1 collapsed, -1 unknown.
+int     limits_nearer_end(void);
 int32_t limits_span_steps(void);
 
 // After a targeted move has stopped: creep onto the target under the encoder.

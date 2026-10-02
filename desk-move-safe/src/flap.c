@@ -8,6 +8,7 @@
 #include "settings.h"
 #include "trace.h"
 #include "led.h"
+#include "limits.h"
 #include "board_config.h"
 
 #include "pico/stdlib.h"
@@ -137,14 +138,12 @@ static bool approaching(int8_t dir, int32_t mm)
 // the flap is what once turned "tap up at 742" into 752 and straight back to
 // 742.
 #define TAP_WINDOW_MS   4000            // the step's ~1 s latency plus its travel
-#define HOLD_AFTER_MS   400             // a held code this soon after = a press
 
 static uint8_t    s_drive_key;          // the recall driving the desk now, 0 = none
 static uint32_t   s_drive_gen;          // announcements before it
 static int32_t    s_tap_from = -1;      // height the last tap started from
 static int8_t     s_tap_dir;
 static TickType_t s_tap_at;
-static TickType_t s_tap_refused_at;     // 0 = none
 
 static int8_t edge_dir(uint8_t k) { return k == KEY_UP_E ? 1 : k == KEY_DOWN_E ? -1 : 0; }
 
@@ -182,6 +181,55 @@ static bool tap_stays_short(int8_t dir)
 // compared with it, and flash is written ONLY when the two differ. Seeing the
 // same height again just confirms it — no write. s_preset_known is a RAM-only
 // "may be trusted for a takeover" flag, cleared when the panel re-saves.
+// Does the flap still have to move before the desk may pass the flap height in
+// this direction? Above it the flap must be COLLAPSED, below it EXPANDED, so
+// the answer is read off the flap itself (the encoder), not remembered: a flap
+// already at the right end lets the desk through, and one that is not stops
+// it — however the desk got here. Without a motor (bench), the old "armed"
+// flag stands in.
+static bool needs_swap(int8_t dir)
+{
+    if (!FLAP_DRIVES_MOTOR)
+        return s_armed;
+    return !limits_at_end(dir > 0);
+}
+
+// A manual move is crossing: hand flap_task a job that moves the flap and
+// gives the bus back. See FLAP_JOB_SWAP.
+static void start_swap(int8_t dir)
+{
+    s_job_key     = FLAP_JOB_SWAP;
+    s_job_dest    = (uint16_t)(dir > 0 ? s_height + 1 : s_height - 1);
+    s_job_running = true;
+    s_job_ready   = true;
+}
+
+// THE CEILING. Would this UP carry the desk past DESK_CEILING_MM? A held UP
+// runs on by the coast after it is let go, so it is refused a coast early. A
+// tap is a fixed DESK_NUDGE_MM step that does not run on, so it is judged by
+// where it ends — refusing taps a coast early stopped the desk at 78.2 cm
+// under an 80 cm ceiling, with a whole tap's room left.
+static bool ceiling_refuses(uint8_t code, int32_t mm)
+{
+    if (!s_ceil_on || !is_up(code) || mm < 0)
+        return false;
+    int32_t c = (int32_t)DESK_CEILING_MM;
+    if (code == KEY_UP_E)
+        return mm + DESK_NUDGE_MM > c;
+    return mm >= c - (int32_t)s_coast_up;
+}
+
+static void ceiling_said(int32_t mm)
+{
+    static TickType_t said;
+    led_refused();
+    if (said && xTaskGetTickCount() - said < pdMS_TO_TICKS(3000))
+        return;
+    said = xTaskGetTickCount() ? xTaskGetTickCount() : 1;
+    printf("[desk] UP refused at %ld mm — the ceiling is %u mm ('desk ceiling off' lifts it)\n",
+           (long)mm, DESK_CEILING_MM);
+}
+
 static void learn(uint8_t key, uint16_t dest)
 {
     int i = slot(key);
@@ -246,9 +294,9 @@ static uint8_t decide(uint8_t panel_code)
         // to exceed it.
         {
             uint8_t ours = wire_pending_key();
-            if (s_ceil_on && is_up(ours) && mm >= 0 &&
-                mm >= (int32_t)DESK_CEILING_MM - (int32_t)s_coast_up) {
+            if (ceiling_refuses(ours, mm)) {
                 s_blocked++;
+                ceiling_said(mm);
                 return KEY_IDLE;        // not consumed: a held code stays held
             }
             return wire_next_key();
@@ -279,6 +327,7 @@ static uint8_t decide(uint8_t panel_code)
         trace_add(TR_RECALL, s_job_key, TRR_PLAN_CROSSES);
         s_job_dest    = dest;
         s_job_running = true;
+        s_job_ready   = true;           // the flap starts with the stop
         begin_stop(dest > s_plan_from ? 1 : -1, mm, true);
         printf("[flap] recall heads for %u mm and crosses %u — stopping\n",
                dest, s_height);
@@ -298,8 +347,7 @@ static uint8_t decide(uint8_t panel_code)
         }
         if (settled(mm)) {
             if (s_job_running) {
-                s_job_ready = true;
-                s_state     = ST_MOVING;
+                s_state = ST_MOVING;    // flap_task already has the job
             } else {
                 s_state = ST_PASS;      // a held move: it has stopped, done
                 printf("[flap] stopped at %ld mm\n", (long)mm);
@@ -342,9 +390,9 @@ static uint8_t decide(uint8_t panel_code)
 
         // The ceiling applies to whatever we are about to send, from any
         // source, and is the one rule that is never skipped.
-        if (s_ceil_on && is_up(panel_code) && mm >= 0 &&
-            mm >= (int32_t)DESK_CEILING_MM - (int32_t)s_coast_up) {
+        if (ceiling_refuses(panel_code, mm)) {
             s_blocked++;
+            ceiling_said(mm);
             return KEY_IDLE;
         }
 
@@ -369,7 +417,10 @@ static uint8_t decide(uint8_t panel_code)
                 // it. Nothing starts moving; nothing has to be stopped.
                 uint16_t lo = (uint16_t)mm < known ? (uint16_t)mm : known;
                 uint16_t hi = (uint16_t)mm < known ? known : (uint16_t)mm;
-                if (s_height > lo && s_height < hi) {
+                int32_t h = (int32_t)s_height;
+                bool at_and_up   = known > h && mm >= h && mm <= h + FLAP_SAFE_GAP_MM && needs_swap(1);
+                bool at_and_down = known < h && mm <= h && mm >= h - FLAP_SAFE_GAP_MM && needs_swap(-1);
+                if ((s_height > lo && s_height < hi) || at_and_up || at_and_down) {
                     s_job_key     = panel_code;
                     s_job_dest    = known;
                     s_job_running = true;
@@ -395,29 +446,52 @@ static uint8_t decide(uint8_t panel_code)
             return panel_code;
         }
 
-        // A tap the flap would have to stop is never sent: stopping it costs a
-        // step back. Disarmed, so a second tap — someone who means it — goes
-        // through. If the edge was the start of a HOLD, the held codes that
-        // follow re-arm it, and a held move is stopped cleanly, with idle.
-        if (edge_dir(panel_code) && s_armed && mm >= 0 &&
-            tap_crosses(edge_dir(panel_code), mm)) {
-            s_armed          = false;
-            s_tap_from       = -1;
-            s_tap_refused_at = xTaskGetTickCount();
-            printf("[flap] a tap from %ld mm would end past %u — not sent. Tap again to pass.\n",
-                   (long)mm, s_height);
+        // AT the flap height — within the safe gap past it — and asked to go
+        // on with the flap not yet set for that side: move the flap here and
+        // now. This is also the retry after a flap move that failed.
+        {
+            int8_t  kd = is_up(panel_code) ? 1 : is_down(panel_code) ? -1 : 0;
+            int32_t h  = (int32_t)s_height;
+            bool    at = kd > 0 ? (mm >= h && mm <= h + FLAP_SAFE_GAP_MM)
+                                : (mm <= h && mm >= h - FLAP_SAFE_GAP_MM);
+            if (kd && mm >= 0 && at && needs_swap(kd)) {
+                s_armed    = false;
+                s_tap_from = -1;
+                start_swap(kd);
+                s_state    = ST_MOVING;
+                printf("[flap] at the flap height (%ld mm) with the flap not %s — moving it.\n"
+                       "       Press again once it has moved.\n",
+                       (long)mm, kd > 0 ? "collapsed" : "expanded");
+                return KEY_IDLE;
+            }
+        }
+
+        // A tap that would end past the flap height, with the flap still on
+        // the wrong side for it: the tap is not sent (stopping one costs a
+        // step back). The flap is moved instead, the desk standing where it
+        // is, and the next tap finds the flap in place and goes through. If
+        // the edge was the start of a HOLD, the held codes wait out the flap
+        // move and then drive the desk on.
+        if (edge_dir(panel_code) && mm >= 0 &&
+            tap_crosses(edge_dir(panel_code), mm) && needs_swap(edge_dir(panel_code))) {
+            s_armed    = false;
+            s_tap_from = -1;
+            start_swap(edge_dir(panel_code));
+            s_state    = ST_MOVING;
+            printf("[flap] a step from %ld mm would pass %u — moving the flap first.\n"
+                   "       Press again once it has moved.\n", (long)mm, s_height);
             return KEY_IDLE;
         }
-        if (s_tap_refused_at && is_motion(panel_code) && !edge_dir(panel_code) &&
-            xTaskGetTickCount() - s_tap_refused_at < pdMS_TO_TICKS(HOLD_AFTER_MS))
-            s_armed = true;             // it was a press, not a tap
-        if (s_tap_refused_at &&
-            xTaskGetTickCount() - s_tap_refused_at >= pdMS_TO_TICKS(HOLD_AFTER_MS))
-            s_tap_refused_at = 0;
 
-        if (s_armed && approaching(dir, mm) && !tap_stays_short(dir)) {
+        if (needs_swap(dir) && approaching(dir, mm) && !tap_stays_short(dir)) {
             printf("[flap] desk approaching %u mm — stopping\n", s_height);
             begin_stop(dir, mm, !is_motion(panel_code));
+            // A HELD key is driving it: stop, move the flap, hand the bus
+            // back. Whoever is holding the key carries on from there.
+            if (is_motion(panel_code)) {
+                start_swap(dir);
+                printf("[flap] a held move — the flap, then the panel has it back\n");
+            }
             // Nobody is holding a key, so a RECALL is driving this move — one
             // that slipped past the takeover (hands-off, flap just switched
             // on, no height at the time). Stopping it and handing the bus back
@@ -431,6 +505,7 @@ static uint8_t decide(uint8_t panel_code)
                 s_job_key     = s_drive_key;
                 s_job_dest    = dest;
                 s_job_running = true;
+                s_job_ready   = true;   // the flap starts with the stop
                 trace_add(TR_RECALL, s_drive_key, TRR_CAUGHT_LATE);
                 printf("[flap] it is a recall to %u mm — the flap, then the recall again\n", dest);
             }
@@ -544,6 +619,60 @@ bool flap_desk_still(void)
            xTaskGetTickCount() - s_active_at > pdMS_TO_TICKS(DESK_STILL_MS);
 }
 
+// THE CROSSING GUARD. The desk must never be above the flap height with the
+// flap not collapsed — that is what breaks things. Normally the intercept sees
+// to it: it stops the desk, moves the flap, and lets the desk on. But the
+// intercept can be off (desk_flap_on 0), suspended (dev mode, the hands-off
+// window) or simply not involved, and then nothing stood between the panel and
+// a collision. So, like the ceiling, this is applied to whatever is about to
+// reach the board: a key that would carry the desk up across the flap height
+// while the flap is not collapsed is replaced with idle.
+//
+// Only UP is guarded. A collapsed flap below the flap height is out of the
+// way, so going down is never refused here — and down is the way out when the
+// desk is found above the flap height with the flap not collapsed, where every
+// move further up is refused.
+//
+// Not while flap_task or the stop sequence owns the desk: those are the
+// firmware bringing the desk TO the flap height in order to move the flap.
+static volatile uint32_t s_cross_refused;
+
+static bool crossing_refused(uint8_t out)
+{
+    if (!FLAP_DRIVES_MOTOR || s_state == ST_MOVING || s_state == ST_STOPPING)
+        return false;
+    int32_t mm = height(), h = (int32_t)s_height;
+    if (mm < 0)
+        return false;
+    if (limits_at_end(true))            // collapsed: free to pass
+        return false;
+    if (mm >= h) {
+        // Above the flap height with the flap not collapsed — however that
+        // came about — and the intercept has not dealt with it (within the
+        // safe gap it moves the flap; further up, or switched off, it cannot).
+        // No higher: every UP is refused, and every recall not known to lead
+        // down.
+        if (is_up(out))
+            return true;
+        if (is_recall(out)) {
+            int i = slot(out);
+            return i < 0 || s_preset_mm[i] == 0 || (int32_t)s_preset_mm[i] > mm;
+        }
+        return false;
+    }
+    if (out == KEY_UP_E)                // a tap: only one that would end past it
+        return tap_crosses(1, mm);
+    if (is_up(out))                     // held: once it could no longer stop short
+        return mm >= h - (int32_t)s_coast_up;
+    if (is_recall(out) && s_state == ST_PASS) {
+        // A recall the intercept is not handling. Known and headed above the
+        // flap height: refused. Unknown: refused too — it cannot be judged.
+        int i = slot(out);
+        return i < 0 || s_preset_mm[i] == 0 || s_preset_mm[i] > h;
+    }
+    return false;
+}
+
 uint8_t flap_decide(uint8_t panel_code)
 {
     uint8_t out = decide(panel_code);
@@ -551,6 +680,18 @@ uint8_t flap_decide(uint8_t panel_code)
         !mode_desk_may_move()) {
         s_refused++;
         led_refused();                  // the person at the panel sees why
+        out = KEY_IDLE;
+    }
+    if (crossing_refused(out)) {
+        static TickType_t said;
+        if (!said || xTaskGetTickCount() - said > pdMS_TO_TICKS(3000)) {
+            said = xTaskGetTickCount() ? xTaskGetTickCount() : 1;
+            printf("[flap] REFUSED: going up %s %u mm with the flap not collapsed%s\n",
+                   height() >= (int32_t)s_height ? "above" : "past", s_height,
+                   s_on ? "" : " (desk_flap_on is 0, so the flap is not moved)");
+        }
+        s_cross_refused++;
+        led_refused();
         out = KEY_IDLE;
     }
     watch_recall(out);                  // what the board actually hears
@@ -564,6 +705,7 @@ uint8_t flap_decide(uint8_t panel_code)
 }
 
 uint32_t flap_refused_moves(void) { return s_refused; }
+uint32_t flap_refused_crossings(void) { return s_cross_refused; }
 
 // ---- settings -------------------------------------------------------------
 
@@ -579,6 +721,8 @@ const char *flap_state_str(void)
 }
 
 bool flap_busy(void) { return s_state != ST_PASS; }
+bool flap_desk_stopping(void) { return s_state == ST_STOPPING; }
+bool flap_job_active(void)    { return s_job_running; }
 
 void flap_set_height(uint16_t mm) { s_height = mm; s_armed = true; }
 uint16_t flap_height(void)        { return s_height; }

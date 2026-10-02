@@ -40,7 +40,7 @@ typedef struct {
     // The bench rig's limits.c record, field for field. All zero until
     // 'lim min' and 'lim max' are stored.
     uint32_t flags;
-    uint32_t min_raw, max_raw;
+    uint32_t expanded_raw, collapsed_raw;
     int32_t  enc_span, span_steps;
     uint32_t steps_per_rev;
     int32_t  backlash;
@@ -49,6 +49,8 @@ typedef struct {
 
 typedef struct {
     uint32_t speed_sps;         // cruise rate, microsteps/s; 0 = board_config.h
+    uint32_t early_start;       // version 3: 1 = the flap starts as the desk is
+                                // told to stop, 0 = once it has stopped
 } settings_mot_t;
 
 typedef struct {
@@ -56,8 +58,10 @@ typedef struct {
     settings_panel_t panel;
     settings_desk_t  desk;
     settings_lim_t   lim;
-    settings_mot_t   mot;       // version 2. New sections go at the END, so
+    settings_mot_t   mot;       // version 2. New fields go at the END, so
                                 // an older record is this one, truncated.
+    uint32_t         desk_early_resume; // version 4. A desk_* value, but here:
+                                        // the desk section cannot grow in place.
 } settings_t;
 
 settings_t *settings(void);     // owners read and write their own section

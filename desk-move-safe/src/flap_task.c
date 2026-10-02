@@ -14,6 +14,10 @@
 #include "wire.h"
 #include "board_config.h"
 #include "trace.h"
+#include "limits.h"
+#include "stepper.h"
+#include "led.h"
+#include "settings.h"
 
 #include "pico/stdlib.h"
 #include "FreeRTOS.h"
@@ -64,7 +68,11 @@ static int32_t settle(uint32_t quiet_ms, uint32_t timeout_ms)
 // desk offers is a 10 mm step, so correcting a 6 mm error means landing 4 mm
 // out on the other side: a stop, a pause and a beep to gain two millimetres.
 // Within DESK_NEAR_MM is close enough, and stopping SHORT is the safe side.
-bool desk_move_to(uint16_t target_mm)
+// on_stop, if given, is called ONCE, the moment the desk is told to stop —
+// at the release point, before a step-in, or at once if it is already there —
+// so whatever waits for the desk (the flap) can start while it coasts. Not
+// called on a failure.
+bool desk_move_to(uint16_t target_mm, void (*on_stop)(void))
 {
     if (target_mm < DESK_MIN_MM || target_mm > DESK_MAX_MM) {
         printf("[desk] %u mm is outside [%u, %u] — refusing\n",
@@ -83,6 +91,7 @@ bool desk_move_to(uint16_t target_mm)
     int32_t err = (int32_t)target_mm - cur;
     if ((err < 0 ? -err : err) <= DESK_NEAR_MM) {
         printf("[desk] already at %ld mm, near enough to %u\n", (long)cur, target_mm);
+        if (on_stop) on_stop();
         return true;
     }
 
@@ -98,6 +107,7 @@ bool desk_move_to(uint16_t target_mm)
     // had its flap run there, 16 mm short of 770, and looked as if it never
     // stopped for the flap at all.
     if (up ? cur >= release : cur <= release) {
+        if (on_stop) on_stop();         // the desk is as good as stopped here
         for (int tries = 0; tries < 3 && !s_abort; tries++) {
             int32_t e = (int32_t)target_mm - cur;
             if ((e < 0 ? -e : e) <= DESK_NEAR_MM)
@@ -152,6 +162,7 @@ bool desk_move_to(uint16_t target_mm)
     }
 
     wire_set_pending(KEY_IDLE);
+    if (on_stop) on_stop();             // the stop just went out
     int32_t landed = settle(1200, 8000);
     int32_t off = landed - (int32_t)target_mm;
     printf("[desk] stopped at %ld mm, %ld from %u\n",
@@ -184,12 +195,136 @@ static bool wait_sent(uint32_t timeout_ms)
 // THIS is where the stepper goes. Everything else in this firmware exists to
 // get the desk stopped at the right height with the bus in hand; the move
 // itself is a dwell until the motor is wired.
-static void run_flap(void)
+// The flap is EXPANDED while the desk is below the flap height and COLLAPSED
+// above it. So a desk on its way up collapses it, one on its way down expands
+// it. The move goes through limits.c like any 'mot go': range-checked, fast
+// to within lim_approach_deg of the end, then crept onto it under the encoder,
+// with the guard watching.
+//
+// Two calls: flap_start() and flap_finish(). Normally flap_start() runs once
+// the desk is still at the flap height. With mot_early_start set it runs
+// earlier — from desk_move_to()'s on-stop hook, the moment the desk is told to
+// stop — so the coast and the flap's travel overlap. Only flap_finish()
+// decides whether the flap got there.
+static volatile bool s_early = FLAP_START_WITH_STOP;    // mot_early_start
+void flap_set_early_start(bool on) { s_early = on; }
+bool flap_early_start(void)        { return s_early; }
+
+// desk_early_resume: re-send the recall when the flap's fast part is over
+// rather than when the flap has settled on its end. "Within reach" is this far
+// from the end by the encoder — the approach distance plus a little.
+#define EARLY_RESUME_MARGIN_DEG  ((double)settings()->lim.approach_deg + 2.0)
+static volatile bool s_resume_early;
+void flap_set_early_resume(bool on) { s_resume_early = on; }
+bool flap_early_resume(void)        { return s_resume_early; }
+
+static bool       s_collapse;           // where this job's flap is going
+static bool       s_flap_started;
+static bool       s_flap_start_ok;
+static TickType_t s_flap_t0;
+static int32_t    s_flap_pos0;          // step counter at the start, for the stall check
+
+static void flap_start(void)
 {
-    printf("[flap] at the height — running the flap\n");
-    trace_add(TR_JOB, TRJ_FLAP_START, 0);
-    vTaskDelay(pdMS_TO_TICKS(FLAP_MOVE_MS));
-    trace_add(TR_JOB, TRJ_FLAP_END, 0);
+    if (s_flap_started) return;
+    s_flap_started = true;
+    s_flap_t0      = xTaskGetTickCount();
+    s_flap_pos0    = stepper_pos();
+    printf("[flap] moving the flap to %s\n", s_collapse ? "COLLAPSED" : "EXPANDED");
+    trace_add(TR_JOB, TRJ_FLAP_START, s_collapse);
+    s_flap_start_ok = !FLAP_DRIVES_MOTOR || limits_goto_end(s_collapse);
+}
+
+// The fast part: wait for the open-loop run to end. True if it ran to its end
+// (which says the pulses went out, not that the flap followed them).
+static int32_t s_fast_steps;
+
+static bool flap_fast(void)
+{
+    bool ok = s_flap_started && s_flap_start_ok;
+
+    if (ok && !FLAP_DRIVES_MOTOR) {             // bench: the dwell, from the start
+        TickType_t left = pdMS_TO_TICKS(FLAP_MOVE_MS);
+        TickType_t gone = xTaskGetTickCount() - s_flap_t0;
+        if (gone < left) vTaskDelay(left - gone);
+        return true;
+    }
+    while (ok && stepper_busy()) {
+        if (s_abort) {
+            stepper_stop();
+            printf("[flap] stopped by 'stop'\n");
+            ok = false;
+        } else if (xTaskGetTickCount() - s_flap_t0 > pdMS_TO_TICKS(FLAP_MOVE_TIMEOUT_MS)) {
+            stepper_stop_hard();
+            printf("[flap] the flap move TIMED OUT after %u s\n", FLAP_MOVE_TIMEOUT_MS / 1000);
+            ok = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    s_fast_steps = stepper_pos() - s_flap_pos0;
+    if (ok)
+        vTaskDelay(pdMS_TO_TICKS(100));         // let the load come to rest
+    else
+        trace_add(TR_JOB, TRJ_FLAP_END, 0);
+    return ok;
+}
+
+// The creep onto the end, under the encoder. True only if the encoder
+// confirms the flap is there.
+static bool flap_settle(void)
+{
+    const char *to = s_collapse ? "COLLAPSED" : "EXPANDED";
+    if (!FLAP_DRIVES_MOTOR) {
+        trace_add(TR_JOB, TRJ_FLAP_END, 1);
+        return true;
+    }
+    double  err;
+    int32_t crept;
+    int     r = limits_settle(&err, &crept);
+    // The creep should only cover the last lim_approach_deg — a few hundred
+    // steps. Far more means the fast part's steps did not turn the flap: the
+    // motor stalled and skipped them. The creep still gets the flap there
+    // (slowly), so it is a warning, not a failure.
+    int32_t fast = s_fast_steps < 0 ? -s_fast_steps : s_fast_steps;
+    if (crept > 1000 && crept * 10 > fast)
+        printf("[flap] STALL: the motor skipped most of the fast part (%ld steps crept).\n"
+               "       Check the driver's supply first; else lower the speed:\n"
+               "       'eeprom set mot_speed_sps <n>' (now %lu).\n",
+               (long)crept, (unsigned long)stepper_speed());
+    bool ok = (r == 0);
+    if (ok)
+        printf("[flap] %s (%+.2f deg from the end)\n", to, err);
+    else
+        printf("[flap] the flap did NOT reach %s — %+.2f deg off after %ld steps of creep\n",
+               to, err, (long)crept);
+    trace_add(TR_JOB, TRJ_FLAP_END, ok);
+    return ok;
+}
+
+// Finish the desk's move by RE-ISSUING the recall, not by driving to the
+// announced height: the board then lands on its own stored preset exactly,
+// with none of our error on top.
+//
+// ONE FRAME, and that is the whole of it. A recall is a one-shot code: the
+// panel puts it on the wire for a single frame and is idle again on the next
+// poll (protocol doc §4). Held for two or three frames instead, the second one
+// reaches a board that has just accepted the first, and it cancels it — the
+// desk sets off, travels about a centimetre and stops there, nowhere near the
+// preset. Whether it survives depends on where the second frame lands in the
+// board's ~1 s of start-up latency, which is why it worked some of the time.
+static void resume_desk(uint8_t key, uint16_t dest)
+{
+    printf("[flap] resuming — re-sending the recall for %u mm\n", dest);
+    trace_add(TR_JOB, TRJ_RESUME, key);
+    wire_send_once(key);
+    trace_add(TR_JOB, TRJ_SENT, wait_sent(WIRE_ONESHOT_TIMEOUT_MS));
+}
+
+// The desk did not get to the flap height: whatever the flap started, stop it.
+static void flap_cancel(void)
+{
+    if (s_flap_started && FLAP_DRIVES_MOTOR)
+        stepper_stop();
 }
 
 void flap_task(void *arg)
@@ -206,41 +341,94 @@ void flap_task(void *arg)
 
         if (!key) {                     // from 'go': just the move
             trace_add(TR_JOB, TRJ_GO, dest);
-            desk_move_to(dest);
+            desk_move_to(dest, NULL);
             flap_job_done();
             trace_add(TR_JOB, s_abort ? TRJ_ABORTED : TRJ_DONE, 0);
             continue;
         }
-        trace_add(TR_JOB, TRJ_TAKE, dest);
+        if (key == FLAP_JOB_SWAP) trace_add(TR_JOB, TRJ_SWAP, dest > flap_height());
+        else                      trace_add(TR_JOB, TRJ_TAKE, dest);
 
-        printf("[flap] taking over: stop at %u, flap, then on to %u mm\n",
-               flap_height(), dest);
+        bool swap = (key == FLAP_JOB_SWAP);      // a manual crossing: no recall
+        if (swap)
+            printf("[flap] manual crossing: the flap, then back to the panel\n");
+        else
+            printf("[flap] taking over: stop at %u, flap, then on to %u mm\n",
+                   flap_height(), dest);
 
-        bool there = desk_move_to(flap_height());
-        trace_add(TR_JOB, TRJ_AT_FLAP, there);
-        if (there && !s_abort) {
-            run_flap();
-            if (!s_abort) {
-                // Resume by RE-ISSUING the recall, not by driving to the
-                // announced height: the board then lands on its own stored
-                // preset exactly, with none of our error on top, and the user
-                // gets the position they actually asked for.
-                //
-                // ONE FRAME, and that is the whole of it. A recall is a
-                // one-shot code: the panel puts it on the wire for a single
-                // frame and is idle again on the next poll (protocol doc §4).
-                // Held for two or three frames instead, the second one reaches
-                // a board that has just accepted the first, and it cancels it
-                // — the desk sets off, travels about a centimetre and stops
-                // there, nowhere near the preset. Whether it survives depends
-                // on where the second frame lands in the board's ~1 s of
-                // start-up latency, which is why it worked some of the time.
-                printf("[flap] resuming — re-sending the recall for %u mm\n", dest);
-                trace_add(TR_JOB, TRJ_RESUME, key);
-                wire_send_once(key);
-                trace_add(TR_JOB, TRJ_SENT, wait_sent(WIRE_ONESHOT_TIMEOUT_MS));
+        // Which way the desk is going decides the flap's end. The destination
+        // says so; without one (a recall caught late with no learned height),
+        // whichever end the flap is nearer, it goes to the other.
+        s_collapse      = dest ? dest > flap_height() : limits_nearer_end() == 0;
+        s_flap_started  = false;
+        s_flap_start_ok = false;
+
+        // flap.c may hand the job over while it is still stopping the desk:
+        // its stop code has gone out, so the flap starts now, and the desk is
+        // waited for. If it could not stop the desk, the job is off.
+        if (flap_desk_stopping()) {
+            if (s_early) flap_start();
+            while (flap_desk_stopping() && !s_abort)
+                vTaskDelay(pdMS_TO_TICKS(20));
+            if (!flap_job_active()) {
+                flap_cancel();
+                printf("[flap] the desk could not be stopped — flap move cancelled\n");
+                flap_job_done();
+                trace_add(TR_JOB, TRJ_ABORTED, 0);
+                continue;
             }
         }
+
+        // Already at the flap height, on the side it is heading for and within
+        // the safe gap: the flap moves right here. Driving the desk back to
+        // the mark first would be a step the wrong way for nothing.
+        int32_t cur0 = height_now();
+        int32_t off0 = cur0 - (int32_t)flap_height();
+        bool    here = cur0 >= 0 &&
+                       (dest > flap_height() ? (off0 >= 0 && off0 <= FLAP_SAFE_GAP_MM)
+                                             : (off0 <= 0 && off0 >= -FLAP_SAFE_GAP_MM));
+        if (here)
+            printf("[desk] at %ld mm, within the safe gap of %u — the flap moves here\n",
+                   (long)cur0, flap_height());
+        bool there = here || desk_move_to(flap_height(), s_early ? flap_start : NULL);
+        trace_add(TR_JOB, TRJ_AT_FLAP, there);
+        if (!there || s_abort)
+            flap_cancel();
+        else
+            flap_start();               // the desk is still; no-op if already started
+        bool ran = there && !s_abort && flap_fast();
+
+        // desk_early_resume: the desk sets off again as soon as the fast part
+        // is over and the ENCODER says the flap really is within reach of its
+        // end — the creep then finishes while the desk moves. If the encoder
+        // does not agree (a stall), wait for the whole flap move as usual.
+        bool resumed = false;
+        if (ran && !s_abort && !swap && s_resume_early && FLAP_DRIVES_MOTOR) {
+            if (limits_near_target(EARLY_RESUME_MARGIN_DEG)) {
+                printf("[flap] the flap is within reach of its end — the desk goes on while it creeps\n");
+                resume_desk(key, dest);
+                resumed = true;
+            } else {
+                printf("[flap] the flap is NOT near its end after the fast part — the desk waits\n");
+            }
+        }
+
+        bool flapped = ran && !s_abort && flap_settle();
+        if (there && !s_abort && !flapped) {
+            led_refused();
+            if (resumed)
+                // Too late to hold the desk: it is already on its way.
+                printf("[flap] FLAP MOVE FAILED in the creep — the desk had ALREADY resumed\n"
+                       "       (desk_early_resume). 'lim' says where the flap is.\n");
+            else
+                // The flap is somewhere unknown, in the desk's path. Staying
+                // put is the only safe answer; the panel has the desk back.
+                printf("[flap] FLAP MOVE FAILED — the desk stays at %u mm%s.\n"
+                       "       'lim' says where the flap is.\n", flap_height(),
+                       swap ? "; pressing again retries" : " and the recall is not sent");
+        }
+        if (flapped && !resumed && !s_abort && !swap)
+            resume_desk(key, dest);
         flap_job_done();
         trace_add(TR_JOB, s_abort ? TRJ_ABORTED : TRJ_DONE, 0);
     }

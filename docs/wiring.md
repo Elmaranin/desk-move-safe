@@ -276,6 +276,22 @@ VBUS on this module, so 5 V on that pad with USB also plugged in back-feeds the
 host port. Unplug one before connecting the other, or put a Schottky in the
 buck's output.
 
+> ⚠️ **Do not power the flap driver (TMC2209 VM) from the controller board's
+> power output port.** The board **cuts that output while the desk is moving**
+> (confirmed with a meter, 2026-10-02) — it is switched, not wired straight to
+> the supply input. Board photo: [desk/2026-09-22 10-49-11.JPG](desk/2026-09-22%2010-49-11.JPG).
+>
+> What it looks like from the firmware: the flap motor loses power mid-move,
+> drops out of step and cannot recover at speed, so it shakes through the rest
+> of the fast part and the flap then creeps the whole travel in 20–30 s
+> (`[flap] STALL`). It only shows when the flap moves while the desk does —
+> `mot_early_start 1`, or a `mot go` during a desk move — which made it look
+> like a software fault.
+>
+> **Give VM a supply that stays on while the desk moves**: a separate 12–24 V
+> adapter, or the desk's supply taken *before* the controller board. Share the
+> ground with the RP2350.
+
 The desk header's 3.3 V is not a candidate for powering the rig — it is sized
 for a panel with an LCD and a few buttons, and a stepper driver's logic plus an
 encoder on top of it is asking for a brown-out that takes the desk down too.

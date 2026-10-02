@@ -41,8 +41,8 @@
 // ---- what is stored -------------------------------------------------------
 // The flap section of the one settings record — the rig's record field for
 // field, minus its magic: settings.c versions the whole record instead.
-#define F_MIN       1u
-#define F_MAX       2u
+#define F_EXPANDED       1u
+#define F_COLLAPSED       2u
 #define R           (settings()->lim)
 
 // A mark made this session carries what a stored one cannot: the counters at
@@ -76,17 +76,17 @@ bool limits_targeted(void) { return s_have_target; }
 
 // ---- geometry -------------------------------------------------------------
 
-static bool calibrated(void) { return (R.flags & (F_MIN | F_MAX)) == (F_MIN | F_MAX); }
+static bool calibrated(void) { return (R.flags & (F_EXPANDED | F_COLLAPSED)) == (F_EXPANDED | F_COLLAPSED); }
 static uint32_t span_mag(void) { return (uint32_t)(R.enc_span < 0 ? -R.enc_span : R.enc_span); }
 static double deg(int64_t counts) { return (double)counts * 360.0 / ENCODER_CPR; }
 
 // Raw angle -> counts along the axis. The subtraction is done in whichever
 // direction the encoder counts from min to max, masked to one turn, and the
-// far side of the circle is folded negative so "a bit below min" reads as a
+// far side of the circle is folded negative so "a bit past expanded" reads as a
 // small negative number rather than as nearly a full turn past max.
 static int64_t along(uint32_t raw)
 {
-    uint32_t u   = (R.enc_span > 0 ? raw - R.min_raw : R.min_raw - raw) & (ENCODER_CPR - 1);
+    uint32_t u   = (R.enc_span > 0 ? raw - R.expanded_raw : R.expanded_raw - raw) & (ENCODER_CPR - 1);
     uint32_t mag = span_mag();
     if (u > mag + (ENCODER_CPR - mag) / 2)
         return (int64_t)u - (int64_t)ENCODER_CPR;
@@ -128,7 +128,7 @@ static int32_t outside_by(int32_t p)
 static const char *past_end(bool at_lo)
 {
     bool min_at_lo = R.span_steps > 0;
-    return (at_lo == min_at_lo) ? "below min" : "beyond max";
+    return (at_lo == min_at_lo) ? "past expanded" : "past collapsed";
 }
 
 // Output degrees for a step figure, via the stored span — so it needs no gear
@@ -143,12 +143,12 @@ static int32_t axis_pos(void) { return stepper_pos() - contact(stepper_last_dir(
 static void say_where(int64_t u)
 {
     if (inside_counts(u))
-        printf("shaft at %.2f deg from min (%ld steps), range %.2f deg — IN RANGE\n",
+        printf("shaft at %.2f deg from expanded (%ld steps), range %.2f deg — IN RANGE\n",
                deg(u), (long)to_steps(u), deg(span_mag()));
     else if (u < 0)
-        printf("shaft is OUT OF RANGE: %.2f deg below min\n", -deg(u));
+        printf("shaft is OUT OF RANGE: %.2f deg past expanded\n", -deg(u));
     else
-        printf("shaft is OUT OF RANGE: %.2f deg beyond max\n", deg(u - span_mag()));
+        printf("shaft is OUT OF RANGE: %.2f deg past collapsed\n", deg(u - span_mag()));
 }
 
 // ---- persistence ----------------------------------------------------------
@@ -166,7 +166,7 @@ void limits_init(void)
 {
     // A record with no range in it has never had an approach chosen either:
     // a zeroed record would otherwise read as "approach 0".
-    if (!(R.flags & (F_MIN | F_MAX)))
+    if (!(R.flags & (F_EXPANDED | F_COLLAPSED)))
         R.approach_deg = LIMIT_APPROACH_DEG;
 
     // span_steps was counted at one microstep setting; if the build or the
@@ -180,14 +180,14 @@ void limits_init(void)
         settings_mark_dirty();
     }
     if (calibrated())
-        printf("[boot] limits: min raw %lu, max raw %lu, %.2f deg = %ld steps, play %ld — motion bounded\n",
-               (unsigned long)R.min_raw, (unsigned long)R.max_raw,
+        printf("[boot] limits: expanded raw %lu, collapsed raw %lu, %.2f deg = %ld steps, play %ld — motion bounded\n",
+               (unsigned long)R.expanded_raw, (unsigned long)R.collapsed_raw,
                deg(span_mag()), (long)R.span_steps, (long)R.backlash);
     else
         printf("[boot] limits: NOT STORED (%s%s) — motor LOCKED and the DESK will not move.\n"
-               "       'init' calibrates the flap.\n",
-               R.flags & F_MIN ? "min stored" : "min missing",
-               R.flags & F_MAX ? ", max stored" : ", max missing");
+               "       'calibrate' calibrates the flap.\n",
+               R.flags & F_EXPANDED ? "expanded stored" : "expanded missing",
+               R.flags & F_COLLAPSED ? ", collapsed stored" : ", collapsed missing");
 }
 
 lim_mode_t limits_mode(void)
@@ -263,7 +263,7 @@ static int64_t reconcile(void)
 static bool refuse_outside(int32_t target, int32_t p)
 {
     int32_t over = outside_by(target);
-    printf("refused: would end %.2f deg %s (range %.2f deg, now %.2f deg from min)\n",
+    printf("refused: would end %.2f deg %s (range %.2f deg, now %.2f deg from expanded)\n",
            steps_deg(over), past_end(target < lo_steps()), deg(span_mag()),
            steps_deg(p - lo_steps()));
     return false;
@@ -301,8 +301,8 @@ bool limits_set_approach(double degrees)
 
 static bool refuse_locked(void)
 {
-    printf("refused: NOT CALIBRATED — no min/max stored, so nothing may move.\n"
-           "  'mot jog <steps>' jogs in small steps; 'lim min' / 'lim max' store the ends.\n");
+    printf("refused: NOT CALIBRATED — no ends stored, so nothing may move.\n"
+           "  'mot jog <steps>' jogs in small steps; 'lim expanded' / 'lim collapsed' store the ends.\n");
     return false;
 }
 
@@ -369,7 +369,7 @@ bool limits_run(bool forward)
     }
     int32_t target = forward ? hi_steps() : lo_steps();
     printf("running %s to %s\n", forward ? "forward" : "backward",
-           target == R.span_steps ? "max" : "min");
+           target == R.span_steps ? "collapsed" : "expanded");
     return limits_goto(target);
 }
 
@@ -442,11 +442,11 @@ bool limits_goto(int32_t axis_steps)
     else if (steps < -margin) run = steps + margin;
 
     if (margin)
-        printf("going to %ld (%.2f deg from min): %+ld steps, the last %.1f deg under the encoder\n",
+        printf("going to %ld (%.2f deg from expanded): %+ld steps, the last %.1f deg under the encoder\n",
                (long)axis_steps, steps_deg(axis_steps), (long)steps,
                run ? (double)R.approach_deg : steps_deg(steps < 0 ? -steps : steps));
     else
-        printf("going to %ld (%.2f deg from min): %+ld steps by count, then checked\n",
+        printf("going to %ld (%.2f deg from expanded): %+ld steps by count, then checked\n",
                (long)axis_steps, steps_deg(axis_steps), (long)steps);
     if (run && !start(run, !inside_counts(u))) {
         s_have_target = false;
@@ -521,6 +521,32 @@ int limits_settle(double *err_deg, int32_t *crept)
     return 1;
 }
 
+bool limits_near_target(double max_deg)
+{
+    if (!s_have_target || !calibrated() || !encoder_available())
+        return false;
+    int32_t err = s_target - to_steps(along(encoder_raw()));
+    return steps_deg(err < 0 ? -err : err) <= max_deg;
+}
+
+#define AT_END_DEG  3.0
+bool limits_at_end(bool collapsed)
+{
+    if (!calibrated() || !encoder_available())
+        return false;
+    int64_t u    = along(encoder_raw());
+    int64_t end  = collapsed ? (int64_t)span_mag() : 0;
+    int64_t off  = u > end ? u - end : end - u;
+    return deg(off) <= AT_END_DEG;
+}
+
+int limits_nearer_end(void)
+{
+    if (!calibrated() || !encoder_available())
+        return -1;
+    return along(encoder_raw()) * 2 > (int64_t)span_mag() ? 1 : 0;
+}
+
 bool limits_goto_end(bool to_max)
 {
     return limits_goto(to_max ? R.span_steps : 0);
@@ -536,7 +562,7 @@ static bool finish_calibration(void)
     int32_t span = (s_max_mark.pos - contact(s_max_mark.dir)) - (s_min_mark.pos - contact(s_min_mark.dir));
 
     if (enc == 0 || span == 0) {
-        printf("min and max are the same place — jog between them first\n");
+        printf("expanded and collapsed are the same place — jog between them first\n");
         return false;
     }
     if (enc >= (int64_t)ENCODER_CPR - 2 * GUARD_COUNTS || enc <= -((int64_t)ENCODER_CPR - 2 * GUARD_COUNTS)) {
@@ -547,7 +573,7 @@ static bool finish_calibration(void)
     }
     R.enc_span   = (int32_t)enc;
     R.span_steps = span;
-    R.flags      = F_MIN | F_MAX;
+    R.flags      = F_EXPANDED | F_COLLAPSED;
 
     // Sanity, not a gate: the two spans should agree with the gear ratio. A
     // big disagreement means steps were lost while jogging, or the magnet is
@@ -584,7 +610,7 @@ static bool remark(bool is_max)
                deg(enc < 0 ? -enc : enc));
         return false;
     }
-    if (is_max) R.max_raw = encoder_raw(); else R.min_raw = encoder_raw();
+    if (is_max) R.collapsed_raw = encoder_raw(); else R.expanded_raw = encoder_raw();
     R.enc_span   = (int32_t)enc;
     R.span_steps = span;
     if (!save()) {
@@ -593,8 +619,8 @@ static bool remark(bool is_max)
     }
     sync_now(false);
     printf("%s moved here: range now %.2f deg = %ld steps, %s. Saved.\n",
-           is_max ? "max" : "min", deg(span_mag()), (long)R.span_steps,
-           R.span_steps > 0 ? "max is forward of min" : "max is backward of min");
+           is_max ? "collapsed" : "expanded", deg(span_mag()), (long)R.span_steps,
+           R.span_steps > 0 ? "collapsed is forward of expanded" : "collapsed is backward of expanded");
     return true;
 }
 
@@ -612,7 +638,7 @@ bool limits_mark(bool is_max)
         return remark(is_max);
     mark_t *mine  = is_max ? &s_max_mark : &s_min_mark;
     mark_t *other = is_max ? &s_min_mark : &s_max_mark;
-    uint32_t oflag = is_max ? F_MIN : F_MAX;
+    uint32_t oflag = is_max ? F_EXPANDED : F_COLLAPSED;
 
     mine->session = true;
     mine->counts  = encoder_counts();
@@ -621,10 +647,10 @@ bool limits_mark(bool is_max)
     mine->sgen    = stepper_pos_gen();
     mine->egen    = encoder_zero_gen();
     uint32_t raw  = encoder_raw();
-    if (is_max) R.max_raw = raw; else R.min_raw = raw;
-    R.flags |= is_max ? F_MAX : F_MIN;
+    if (is_max) R.collapsed_raw = raw; else R.expanded_raw = raw;
+    R.flags |= is_max ? F_COLLAPSED : F_EXPANDED;
 
-    printf("%s stored: raw %lu (%.3f deg)\n", is_max ? "max" : "min",
+    printf("%s stored: raw %lu (%.3f deg)\n", is_max ? "collapsed" : "expanded",
            (unsigned long)raw, (double)raw * 360.0 / ENCODER_CPR);
     if (!R.backlash && !(R.flags & oflag))
         printf("  no play stored — if the gearbox has backlash, 'reset' then 'lim play' first\n");
@@ -634,12 +660,12 @@ bool limits_mark(bool is_max)
         if (!other->session) {
             printf("  %s was stored in an earlier session, so the steps between the ends\n"
                    "  cannot be counted — jog there and '%s' again\n",
-                   is_max ? "min" : "max", is_max ? "lim min" : "lim max");
+                   is_max ? "expanded" : "collapsed", is_max ? "lim expanded" : "lim collapsed");
             ok = false;
         } else if (other->sgen != mine->sgen || other->egen != mine->egen) {
             printf("  a counter was zeroed or hard-stopped since %s was stored — jog\n"
                    "  there and '%s' again\n",
-                   is_max ? "min" : "max", is_max ? "lim min" : "lim max");
+                   is_max ? "expanded" : "collapsed", is_max ? "lim expanded" : "lim collapsed");
             ok = false;
         } else {
             ok = finish_calibration();
@@ -656,12 +682,12 @@ bool limits_mark(bool is_max)
     }
     if (calibrated()) {
         printf("CALIBRATED: %.2f deg of travel = %ld steps, %s. Saved.\n"
-               "  'mot go min' / 'mot go max' move between the ends; 'lim' shows where you are.\n",
+               "  'mot go expanded' / 'mot go collapsed' move between the ends; 'lim' shows where you are.\n",
                deg(span_mag()), (long)R.span_steps,
-               R.span_steps > 0 ? "max is forward of min" : "max is backward of min");
+               R.span_steps > 0 ? "collapsed is forward of expanded" : "collapsed is backward of expanded");
         sync_now(false);
     } else {
-        printf("  saved. Jog to the other end and 'lim %s'.\n", is_max ? "min" : "max");
+        printf("  saved. Jog to the other end and 'lim %s'.\n", is_max ? "expanded" : "collapsed");
     }
     return true;
 }
@@ -669,7 +695,7 @@ bool limits_mark(bool is_max)
 bool limits_set_span(int32_t steps)
 {
     if (!calibrated()) {
-        printf("no range stored — 'lim min' / 'lim max' first\n");
+        printf("no range stored — 'lim expanded' / 'lim collapsed' first\n");
         return false;
     }
     if (stepper_busy()) {
@@ -677,7 +703,7 @@ bool limits_set_span(int32_t steps)
         return false;
     }
     if (steps == 0 || (steps > 0) != (R.span_steps > 0)) {
-        printf("span must keep its sign: max is %s of min, so %s\n",
+        printf("span must keep its sign: collapsed is %s of expanded, so %s\n",
                R.span_steps > 0 ? "forward" : "backward",
                R.span_steps > 0 ? "positive" : "negative");
         return false;
@@ -698,7 +724,7 @@ bool limits_set_span(int32_t steps)
 bool limits_store_span(void)
 {
     if (!calibrated()) {
-        printf("no range stored — 'lim min' / 'lim max' first\n");
+        printf("no range stored — 'lim expanded' / 'lim collapsed' first\n");
         return false;
     }
     if (!encoder_available()) {
@@ -710,21 +736,21 @@ bool limits_store_span(void)
         return false;
     }
     if (!s_synced || s_origin_gen != stepper_pos_gen()) {
-        printf("the step counter is not seeded — 'mot go min' then 'mot go max' first\n");
+        printf("the step counter is not seeded — 'mot go expanded' then 'mot go collapsed' first\n");
         return false;
     }
     int64_t u   = along(encoder_raw());
     int64_t tol = (int64_t)(LIMIT_SETTLE_DEG / 360.0 * ENCODER_CPR);
     if (u < (int64_t)span_mag() - tol || u > (int64_t)span_mag() + tol) {
-        printf("the shaft is %.2f deg from min, not on max — 'mot go max' first, then this\n", deg(u));
+        printf("the shaft is %.2f deg from expanded, not at collapsed — 'mot go collapsed' first, then this\n", deg(u));
         return false;
     }
     int32_t p = axis_pos();
     if (p == 0 || (p > 0) != (R.span_steps > 0)) {
-        printf("the step counter reads %ld from min — not a span. 'mot go min', 'mot go max', then this\n", (long)p);
+        printf("the step counter reads %ld from expanded — not a span. 'mot go expanded', 'mot go collapsed', then this\n", (long)p);
         return false;
     }
-    printf("shaft on max (%.3f deg from it); step counter says %ld from min\n",
+    printf("shaft at collapsed (%.3f deg from it); step counter says %ld from expanded\n",
            deg(u - (int64_t)span_mag()), (long)p);
     return limits_set_span(p);
 }
@@ -739,8 +765,8 @@ bool limits_clear(void)
     // depend on. Backlash and approach are properties of the gearbox and of
     // taste, still true after the ends move, so they stay.
     R.flags         = 0;
-    R.min_raw       = 0;
-    R.max_raw       = 0;
+    R.expanded_raw       = 0;
+    R.collapsed_raw       = 0;
     R.enc_span      = 0;
     R.span_steps    = 0;
     R.steps_per_rev = 0;
@@ -748,7 +774,7 @@ bool limits_clear(void)
     s_min_mark = s_max_mark = (mark_t){ 0 };
     s_synced = false;
     printf("flap calibration cleared — the motor only jogs and the DESK will not\n"
-           "  move until min and max are stored again. Backlash %ld and approach\n"
+           "  move until both ends are stored again. Backlash %ld and approach\n"
            "  %.1f deg kept.\n",
            (long)R.backlash, (double)R.approach_deg);
     return true;
@@ -952,10 +978,10 @@ bool limits_measure_play(double move_deg)
 // The flash record, field by field, exactly as stored — no derivation.
 static void dump_record(void)
 {
-    printf("  stored: flags 0x%lx (%s%s) | min_raw %lu | max_raw %lu | enc_span %ld | span_steps %ld | steps_per_rev %lu | play %ld | approach %.1f deg\n",
+    printf("  stored: flags 0x%lx (%s%s) | expanded_raw %lu | collapsed_raw %lu | enc_span %ld | span_steps %ld | steps_per_rev %lu | play %ld | approach %.1f deg\n",
            (unsigned long)R.flags,
-           R.flags & F_MIN ? "min" : "-", R.flags & F_MAX ? "+max" : "",
-           (unsigned long)R.min_raw, (unsigned long)R.max_raw,
+           R.flags & F_EXPANDED ? "expanded" : "-", R.flags & F_COLLAPSED ? "+collapsed" : "",
+           (unsigned long)R.expanded_raw, (unsigned long)R.collapsed_raw,
            (long)R.enc_span, (long)R.span_steps,
            (unsigned long)R.steps_per_rev, (long)R.backlash, (double)R.approach_deg);
 }
@@ -964,25 +990,25 @@ void limits_report(void)
 {
     dump_record();
     if (!calibrated()) {
-        printf("limits: NOT CALIBRATED — min %s, max %s. Motor LOCKED%s, desk LOCKED.\n",
-               R.flags & F_MIN ? "stored" : "missing",
-               R.flags & F_MAX ? "stored" : "missing",
+        printf("limits: NOT CALIBRATED — expanded %s, collapsed %s. Motor LOCKED%s, desk LOCKED.\n",
+               R.flags & F_EXPANDED ? "stored" : "missing",
+               R.flags & F_COLLAPSED ? "stored" : "missing",
                s_free ? " (overridden by 'lim free')" : "");
-        if (R.flags & F_MIN)
-            printf("  min raw %lu%s\n", (unsigned long)R.min_raw,
+        if (R.flags & F_EXPANDED)
+            printf("  expanded raw %lu%s\n", (unsigned long)R.expanded_raw,
                    s_min_mark.session ? "" : " (earlier session — store it again)");
-        if (R.flags & F_MAX)
-            printf("  max raw %lu%s\n", (unsigned long)R.max_raw,
+        if (R.flags & F_COLLAPSED)
+            printf("  collapsed raw %lu%s\n", (unsigned long)R.collapsed_raw,
                    s_max_mark.session ? "" : " (earlier session — store it again)");
         printf("  play %ld microsteps%s\n", (long)R.backlash,
                R.backlash ? "" : " — 'lim play [deg]' measures it, 'eeprom set lim_backlash <n>' sets it");
-        printf("  'init' walks through it. By hand: 'mot jog <steps>' to an end, 'lim min';\n"
-               "  'mot jog' to the other, 'lim max'. Both in one session, no zero or halt in\n"
+        printf("  'calibrate' walks through it. By hand: 'mot jog <steps>' to an end, 'lim expanded';\n"
+               "  'mot jog' to the other, 'lim collapsed'. Both in one session, no zero or halt in\n"
                "  between. The range must fit in one turn.\n");
         return;
     }
-    printf("limits: min raw %lu | max raw %lu | %.2f deg of travel = %ld steps (max is %s of min) | play %ld%s\n",
-           (unsigned long)R.min_raw, (unsigned long)R.max_raw,
+    printf("limits: expanded raw %lu | collapsed raw %lu | %.2f deg of travel = %ld steps (collapsed is %s of expanded) | play %ld%s\n",
+           (unsigned long)R.expanded_raw, (unsigned long)R.collapsed_raw,
            deg(span_mag()), (long)R.span_steps,
            R.span_steps > 0 ? "forward" : "backward", (long)R.backlash,
            s_free ? " — NOT ENFORCED ('lim free')" : "");
@@ -1027,5 +1053,5 @@ void limits_poll_trip(void)
     int64_t u = s_trip_u;
     printf("\nLIMIT GUARD: the shaft went %.2f deg %s — HARD STOP. The step counter is\n"
            "  re-seeded from the encoder on the next move; 'lim' to see where it is.\n> ",
-           u < 0 ? -deg(u) : deg(u - span_mag()), u < 0 ? "below min" : "beyond max");
+           u < 0 ? -deg(u) : deg(u - span_mag()), u < 0 ? "past expanded" : "past collapsed");
 }

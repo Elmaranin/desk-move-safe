@@ -59,7 +59,7 @@ Every command below is **development only** — the board boots into working mod
 and refuses them until you say so:
 
 ```text
-dev start               unlock the motor commands; gone at the next reset
+dev start               unlock the motor commands; gone at the next reboot
 ```
 
 Working mode is not a reduced console, it is the console for a board under a
@@ -262,10 +262,12 @@ attached, and `tmc scan` asks all four addresses.
 1. **Rotation** — done. The AVR446 ramp out of an alarm ISR, `mot` and `tmc`.
 2. **MT6835** — done. The 21-bit encoder on SPI1, `enc` and `enc watch`, and
    the boot self-check now asks it a real question.
-3. **Travel limits** — done. `limits.c` from the rig: min and max stored in flash,
+3. **Travel limits** — done. `limits.c` from the rig: both ends stored in flash,
    backlash, and the creep onto a target under the encoder, calibrated with
-   `init`. Its values go in `settings()->lim` and it marks the settings dirty
+   `calibrate`. Its values go in `settings()->lim` and it marks the settings dirty
    like everything else — `nvs` keeps exactly one record and `settings.c` is
    the only thing that may write it.
-4. **The desk** — `run_flap()` in `flap_task.c` is a two-second dwell today.
-   That is the line that becomes a real move.
+4. **The desk** — done. The flap move (`flap_start()` / `flap_finish()`) collapses the flap when the desk goes up
+   past the flap height and expands it when it goes down, once the desk
+   has stopped there; a flap that does not get there leaves the desk where it is. See
+   [operation.md](operation.md#the-flap-move).
