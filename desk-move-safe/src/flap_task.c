@@ -49,7 +49,14 @@ static int32_t height_now(void)
 
 // Wait for the height to stop changing, and return where it stopped. The quiet
 // timer re-arms on every change, so this cannot return while it is drifting.
-static int32_t settle(uint32_t quiet_ms, uint32_t timeout_ms)
+// Close to the target, a shorter quiet is enough to call the desk stopped.
+// Going up the board ends a move with a slow crawl — a millimetre every 0.3 to
+// 0.7 s — and waiting out 1.2 s of silence after each one kept the flap job
+// (and desk_resume_pct) waiting a second or two for a desk that was, to within
+// a millimetre or two, already there.
+#define SETTLE_NEAR_QUIET_MS    400
+
+static int32_t settle_near(uint32_t quiet_ms, uint32_t timeout_ms, int32_t target)
 {
     TickType_t t0 = xTaskGetTickCount();
     int32_t last = height_now();
@@ -57,10 +64,21 @@ static int32_t settle(uint32_t quiet_ms, uint32_t timeout_ms)
     while (xTaskGetTickCount() - t0 < pdMS_TO_TICKS(timeout_ms)) {
         vTaskDelay(pdMS_TO_TICKS(50));
         int32_t cur = height_now();
-        if (cur != last) { last = cur; stable = xTaskGetTickCount(); }
-        else if (xTaskGetTickCount() - stable >= pdMS_TO_TICKS(quiet_ms)) break;
+        if (cur != last) { last = cur; stable = xTaskGetTickCount(); continue; }
+        TickType_t quiet = xTaskGetTickCount() - stable;
+        int32_t    off   = last - target;
+        if (quiet >= pdMS_TO_TICKS(quiet_ms))
+            break;
+        if (target >= 0 && last >= 0 && (off < 0 ? -off : off) <= DESK_NEAR_MM &&
+            quiet >= pdMS_TO_TICKS(SETTLE_NEAR_QUIET_MS))
+            break;
     }
     return last;
+}
+
+static int32_t settle(uint32_t quiet_ms, uint32_t timeout_ms)
+{
+    return settle_near(quiet_ms, timeout_ms, -1);
 }
 
 // Drive, release early, let it coast, confirm it stopped. That is the whole
@@ -163,7 +181,7 @@ bool desk_move_to(uint16_t target_mm, void (*on_stop)(void))
 
     wire_set_pending(KEY_IDLE);
     if (on_stop) on_stop();             // the stop just went out
-    int32_t landed = settle(1200, 8000);
+    int32_t landed = settle_near(1200, 8000, target_mm);
     int32_t off = landed - (int32_t)target_mm;
     printf("[desk] stopped at %ld mm, %ld from %u\n",
            (long)landed, (long)(off < 0 ? -off : off), target_mm);
@@ -210,13 +228,58 @@ static volatile bool s_early = FLAP_START_WITH_STOP;    // mot_early_start
 void flap_set_early_start(bool on) { s_early = on; }
 bool flap_early_start(void)        { return s_early; }
 
-// desk_early_resume: re-send the recall when the flap's fast part is over
-// rather than when the flap has settled on its end. "Within reach" is this far
-// from the end by the encoder — the approach distance plus a little.
-#define EARLY_RESUME_MARGIN_DEG  ((double)settings()->lim.approach_deg + 2.0)
-static volatile bool s_resume_early;
-void flap_set_early_resume(bool on) { s_resume_early = on; }
-bool flap_early_resume(void)        { return s_resume_early; }
+// desk_resume_pct: re-send the recall once the flap has covered this share of
+// its move, measured by the encoder. 100, the default: only once it has
+// settled on its end. Below that the desk sets off while the flap finishes —
+// checked through the fast part and once more at its end; a share that the
+// fast part does not reach (it stops lim_approach_deg short) means the end
+// of the creep, the same as 100.
+static volatile uint8_t s_resume_pct = 100;
+void    flap_set_resume_pct(uint8_t pct) { s_resume_pct = pct; }
+uint8_t flap_resume_pct(void)            { return s_resume_pct; }
+
+// A recall must reach a desk that has FINISHED moving. One that arrives while
+// the board is still in the slow crawl that ends a move up is announced and
+// then dropped — the desk stays where it is (2026-10-03). The flap may start
+// sooner; the recall waits for this much stillness.
+#define RESUME_STILL_MS     1200
+#define RESUME_CHECK_MS     4000    // the desk should be on its way by then
+#define RESUME_MOVED_MM     5
+
+static bool wait_still(uint32_t still_ms, uint32_t timeout_ms)
+{
+    TickType_t t0 = xTaskGetTickCount();
+    while (desk_still_ms() < still_ms) {
+        if (s_abort || xTaskGetTickCount() - t0 > pdMS_TO_TICKS(timeout_ms))
+            return false;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return true;
+}
+
+// Has the flap covered desk_resume_pct of its move? Then send the desk on —
+// once. `can` is false for a manual crossing, which has no recall to send.
+//
+// The recall is only QUEUED here: the bus sends it on the panel's next poll,
+// and the flap carries on meanwhile. Waiting for it to go out (up to a second)
+// is what used to hold the creep back until the desk had started. Whether it
+// went out is checked once the flap is done.
+static void maybe_resume(bool can, uint8_t key, uint16_t dest, bool *resumed)
+{
+    if (!can || *resumed || s_abort || s_resume_pct >= 100 || !FLAP_DRIVES_MOTOR)
+        return;
+    if (desk_still_ms() < RESUME_STILL_MS)
+        return;                         // the desk is still finishing: later
+    double p = limits_progress();
+    if (p >= 0.0 && p * 100.0 >= (double)s_resume_pct) {
+        printf("[flap] the flap is %.0f%% of the way — the desk goes on (desk_resume_pct %u)\n",
+               p * 100.0, s_resume_pct);
+        printf("[flap] resuming — re-sending the recall for %u mm\n", dest);
+        trace_add(TR_JOB, TRJ_RESUME, key);
+        wire_send_once(key);
+        *resumed = true;
+    }
+}
 
 static bool       s_collapse;           // where this job's flap is going
 static bool       s_flap_started;
@@ -239,7 +302,7 @@ static void flap_start(void)
 // (which says the pulses went out, not that the flap followed them).
 static int32_t s_fast_steps;
 
-static bool flap_fast(void)
+static bool flap_fast(bool can, uint8_t key, uint16_t dest, bool *resumed)
 {
     bool ok = s_flap_started && s_flap_start_ok;
 
@@ -258,12 +321,20 @@ static bool flap_fast(void)
             stepper_stop_hard();
             printf("[flap] the flap move TIMED OUT after %u s\n", FLAP_MOVE_TIMEOUT_MS / 1000);
             ok = false;
+        } else {
+            maybe_resume(can, key, dest, resumed);
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     s_fast_steps = stepper_pos() - s_flap_pos0;
-    if (ok)
+    if (FLAP_DRIVES_MOTOR) {
+        double p = limits_progress();
+        trace_add(TR_JOB, TRJ_FAST_END, p < 0.0 ? -1 : (int32_t)(p * 100.0 + 0.5));
+    }
+    if (ok) {
         vTaskDelay(pdMS_TO_TICKS(100));         // let the load come to rest
+        maybe_resume(can, key, dest, resumed);
+    }
     else
         trace_add(TR_JOB, TRJ_FLAP_END, 0);
     return ok;
@@ -314,6 +385,7 @@ static bool flap_settle(void)
 // board's ~1 s of start-up latency, which is why it worked some of the time.
 static void resume_desk(uint8_t key, uint16_t dest)
 {
+    wait_still(RESUME_STILL_MS, 3000);
     printf("[flap] resuming — re-sending the recall for %u mm\n", dest);
     trace_add(TR_JOB, TRJ_RESUME, key);
     wire_send_once(key);
@@ -325,6 +397,30 @@ static void flap_cancel(void)
 {
     if (s_flap_started && FLAP_DRIVES_MOTOR)
         stepper_stop();
+}
+
+// The recall went out; did the desk set off? It should be a few millimetres
+// on its way towards the destination within RESUME_CHECK_MS. If not, the board
+// dropped the recall — send it once more, to a desk that is still, rather than
+// leave it parked at the flap height.
+static void confirm_resume(uint8_t key, uint16_t dest)
+{
+    int32_t from = height_now();
+    if (from < 0 || !dest)
+        return;
+    int8_t     dir = dest > from ? 1 : -1;
+    TickType_t t0  = xTaskGetTickCount();
+    while (xTaskGetTickCount() - t0 < pdMS_TO_TICKS(RESUME_CHECK_MS)) {
+        int32_t now = height_now();
+        if (now >= 0 && (now - from) * dir >= RESUME_MOVED_MM)
+            return;                     // on its way
+        if (s_abort)
+            return;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    printf("[flap] the desk did not set off — the recall was dropped. Sending it again.\n");
+    trace_add(TR_JOB, TRJ_RETRY, key);
+    resume_desk(key, dest);
 }
 
 void flap_task(void *arg)
@@ -396,30 +492,18 @@ void flap_task(void *arg)
             flap_cancel();
         else
             flap_start();               // the desk is still; no-op if already started
-        bool ran = there && !s_abort && flap_fast();
-
-        // desk_early_resume: the desk sets off again as soon as the fast part
-        // is over and the ENCODER says the flap really is within reach of its
-        // end — the creep then finishes while the desk moves. If the encoder
-        // does not agree (a stall), wait for the whole flap move as usual.
+        // desk_resume_pct below 100: the desk may set off while the flap is
+        // still on its way, once the encoder says it has covered that share.
         bool resumed = false;
-        if (ran && !s_abort && !swap && s_resume_early && FLAP_DRIVES_MOTOR) {
-            if (limits_near_target(EARLY_RESUME_MARGIN_DEG)) {
-                printf("[flap] the flap is within reach of its end — the desk goes on while it creeps\n");
-                resume_desk(key, dest);
-                resumed = true;
-            } else {
-                printf("[flap] the flap is NOT near its end after the fast part — the desk waits\n");
-            }
-        }
+        bool ran = there && !s_abort && flap_fast(!swap, key, dest, &resumed);
 
         bool flapped = ran && !s_abort && flap_settle();
         if (there && !s_abort && !flapped) {
             led_refused();
             if (resumed)
                 // Too late to hold the desk: it is already on its way.
-                printf("[flap] FLAP MOVE FAILED in the creep — the desk had ALREADY resumed\n"
-                       "       (desk_early_resume). 'lim' says where the flap is.\n");
+                printf("[flap] FLAP MOVE FAILED — the desk had ALREADY resumed\n"
+                       "       (desk_resume_pct %u). 'lim' says where the flap is.\n", s_resume_pct);
             else
                 // The flap is somewhere unknown, in the desk's path. Staying
                 // put is the only safe answer; the panel has the desk back.
@@ -429,6 +513,10 @@ void flap_task(void *arg)
         }
         if (flapped && !resumed && !s_abort && !swap)
             resume_desk(key, dest);
+        if (resumed)                    // queued early: make sure it went out
+            trace_add(TR_JOB, TRJ_SENT, wait_sent(WIRE_ONESHOT_TIMEOUT_MS));
+        if ((resumed || flapped) && !swap && !s_abort)
+            confirm_resume(key, dest);
         flap_job_done();
         trace_add(TR_JOB, s_abort ? TRJ_ABORTED : TRJ_DONE, 0);
     }

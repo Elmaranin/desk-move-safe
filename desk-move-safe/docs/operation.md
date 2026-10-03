@@ -66,9 +66,8 @@ watching changes nothing on the bus. A recall issued while the desk is already
 at that preset is not announced, so it teaches nothing.
 
 Everything else is written only when asked: `eeprom set`, `calibrate`, `lim`,
-`reset`. Two one-off exceptions, both after a firmware update: a record in an
-older layout is rewritten in the new one, and the flap's step count is rescaled
-if the microstepping changed.
+`reset`. One exception, after a firmware update: a record in an older layout
+is rewritten in the new one.
 
 **Whether the desk is stopped at all is read off the flap itself.** Above the
 flap height the flap must be collapsed, below it expanded. A move heading across
@@ -172,7 +171,7 @@ driver check too (`FLAP_DRIVES_MOTOR`, 1 since 2026-10-02).
 
 Unlocks the commands that drive something directly, poke at a register or
 change the flap's stored range: `mot`, `tmc`, `enc`, `lim expanded`/`collapsed` and the
-rest of `lim`, `go`, and `eeprom set` for the `lim_*`, `mot_*` and `desk_early_resume`
+rest of `lim`, `go`, and `eeprom set` for the `lim_*`, `mot_*` and `desk_resume_pct`
 parameters. Everything an installer needs — `status`, `calibrate`, `reset`, `desk`, `debug`,
 `eeprom` and `eeprom set` for the `panel_*` and `desk_*` parameters, `lim`,
 `stop` — stays available in working mode, because
@@ -195,8 +194,10 @@ build fails if the two disagree.
 ### What is stored in flash
 
 The preset heights, both coast figures, the flap height and whether the flap
-stop is enabled, the flap's calibration (both ends angle, the steps between
-them, backlash, approach) and the flap motor's speed — one CRC-checked record
+stop is enabled, the flap's calibration (the angle at each end and two
+directions, backlash, approach), the flap motor's speed, and the two timing
+choices — when the flap starts (`mot_early_start`) and when the desk moves on
+(`desk_resume_pct`) — one CRC-checked record
 in the last flash sector, restored at boot before the bus runs. `eeprom` lists
 every field; [commands.md](commands.md#parameters-explained) explains each one.
 
@@ -282,12 +283,16 @@ then is the recall re-sent to finish the desk's move. If the desk does not
 reach the flap height (stalled, could not be stopped, `stop`), the flap move is
 stopped too.
 
-**When the desk moves on is a stored parameter too, `desk_early_resume`.** 0
-(the default): once the flap has settled on its end. 1: as soon as the flap's
-fast move is over and the encoder puts it within reach of its end; the creep
-then finishes while the desk moves. With 1 a creep that fails can no longer hold
-the desk back. [commands.md](commands.md#when-the-desk-moves-on-desk_early_resume)
-has the detail.
+**When the desk moves on is a stored parameter too, `desk_resume_pct`.** 100
+(the default): once the flap has settled on its end. Below 100: once the flap
+has covered that share of its move, by the encoder, so the desk sets off while
+the flap finishes. A flap that then fails can no longer hold the desk back.
+On this desk it gains almost nothing: at 5000 steps/s with `mot_early_start 1`
+the flap is 93–99% done by the time a recall may go, so 100 is the setting.
+The recall only ever goes to a desk that has been still for 1.2 s — one sent
+during the board's final crawl is dropped — and if the desk has not set off
+4 s later it is sent once more.
+[commands.md](commands.md#when-the-desk-moves-on-desk_resume_pct) has the detail.
 
 **If the flap does not get there** — the move is refused, times out after
 `FLAP_MOVE_TIMEOUT_MS` (20 s), `stop` is typed, or it does not settle within

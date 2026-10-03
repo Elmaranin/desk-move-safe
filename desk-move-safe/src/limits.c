@@ -1,29 +1,21 @@
 //
 // limits — stored travel range and its enforcement. See limits.h.
 //
-// Coordinates. Everything here is on an "axis" measured from min:
+// One coordinate: u, encoder counts along the range from the expanded end —
+// 0 at expanded, span_mag() at collapsed, negative past expanded, beyond the
+// span past collapsed. It comes straight from the raw angle, so it is absolute
+// and needs no seeding, and it is the only position anything here trusts.
 //
-//   counts   u   0 at min, |enc_span| at max, in sensor counts of the measured
-//                shaft; negative below min, past |enc_span| beyond max. Comes
-//                straight from the raw angle, so it is absolute.
-//   steps    p   0 at min, span_steps at max, in microsteps; span_steps carries
-//                the sign of the motor direction that goes from min to max.
-//                Comes from the step counter, so it is exact between moves and
-//                wrong after lost steps or a hand-turned shaft.
-//
-// The step counter is the working coordinate — it is what a move is made of —
-// and the angle is the truth it is checked against: before every move the two
-// are compared, and if they disagree by more than LIMIT_RESYNC_DEG the origin is
-// re-seeded from the angle and the operator is told.
+// Motor steps are only ever an ESTIMATE of encoder counts, through the gear
+// ratio (steps_per_count()): good enough to size a jog, a braking distance or
+// a creep increment, never used to decide where the flap is.
 //
 // Backlash. A gearbox has play: after a reversal the motor turns some number of
-// microsteps before the output moves at all. The step axis is kept in *output*
-// terms by treating the motor as resting on one side of that play or the other
-// — contact() is the offset between motor and output for the direction it last
-// moved — and every move that reverses direction is lengthened by the play so
-// the output travels the distance asked for. The amount is measured by
-// 'lim play' (creep across the reversal until the encoder moves) or typed in,
-// and stored with the ends. Left at zero it changes nothing.
+// microsteps before the output moves at all. Open-loop moves (jogs, 'mot move')
+// that reverse direction are lengthened by it so the output travels the
+// distance asked for. Encoder-steered moves do not need it — they stop on the
+// encoder — and the creep deliberately leaves it out. Measured by 'lim play'
+// or typed in; zero changes nothing.
 //
 #include "limits.h"
 #include "settings.h"
@@ -39,116 +31,111 @@
 #include <stdlib.h>
 
 // ---- what is stored -------------------------------------------------------
-// The flap section of the one settings record — the rig's record field for
-// field, minus its magic: settings.c versions the whole record instead.
-#define F_EXPANDED       1u
-#define F_COLLAPSED       2u
-#define R           (settings()->lim)
+#define F_EXPANDED      1u
+#define F_COLLAPSED     2u
+#define R               (settings()->lim)
+#define MASK            (ENCODER_CPR - 1)
 
-// A mark made this session carries what a stored one cannot: the counters at
-// the moment it was made, so the second mark can measure the span exactly.
+// A mark made this session: the continuous encoder count when it was made, so
+// the second mark can tell which way round the flap went between them.
 typedef struct {
     bool     session;
     int64_t  counts;
-    int32_t  pos;
-    int8_t   dir;           // which side of the play the motor sat on
-    uint32_t sgen, egen;
+    uint32_t egen;
 } mark_t;
 
-static mark_t s_min_mark, s_max_mark;
+static mark_t s_exp_mark, s_col_mark;
 
-static bool     s_free;
-static bool     s_synced;
-static int32_t  s_origin;       // stepper_pos() at which the axis reads 0
-static uint32_t s_origin_gen;
-static bool     s_bypass;       // the move in flight started outside; guard off
+static bool              s_free;
+static volatile bool     s_bypass;      // the move in flight started outside; guard off
 
-static volatile bool    s_tripped;
-static volatile int64_t s_trip_u;
+static volatile bool     s_tripped;
+static volatile int64_t  s_trip_u;
 
-static int32_t s_target;        // axis steps the last targeted move aimed at
+static int64_t s_target;                // u counts the last targeted move aimed at
+static int64_t s_from;                  // ... and where it started
 static bool    s_have_target;
 
 bool limits_targeted(void) { return s_have_target; }
 
 #define GUARD_COUNTS    ((int64_t)(LIMIT_GUARD_DEG  / 360.0 * ENCODER_CPR))
-#define RESYNC_COUNTS   ((int64_t)(LIMIT_RESYNC_DEG / 360.0 * ENCODER_CPR))
+#define SETTLE_COUNTS   ((int64_t)(LIMIT_SETTLE_DEG / 360.0 * ENCODER_CPR))
 
 // ---- geometry -------------------------------------------------------------
 
-static bool calibrated(void) { return (R.flags & (F_EXPANDED | F_COLLAPSED)) == (F_EXPANDED | F_COLLAPSED); }
-static uint32_t span_mag(void) { return (uint32_t)(R.enc_span < 0 ? -R.enc_span : R.enc_span); }
 static double deg(int64_t counts) { return (double)counts * 360.0 / ENCODER_CPR; }
+static int64_t counts_of(double degrees) { return (int64_t)llround(degrees / 360.0 * ENCODER_CPR); }
 
-// Raw angle -> counts along the axis. The subtraction is done in whichever
-// direction the encoder counts from min to max, masked to one turn, and the
-// far side of the circle is folded negative so "a bit past expanded" reads as a
-// small negative number rather than as nearly a full turn past max.
+static bool ends_stored(void) { return (R.flags & (F_EXPANDED | F_COLLAPSED)) == (F_EXPANDED | F_COLLAPSED); }
+static bool calibrated(void)  { return ends_stored() && R.enc_dir != 0 && R.mot_dir != 0; }
+
+// The arc from expanded to collapsed, the way the flap travels it.
+static uint32_t arc(uint32_t from, uint32_t to, int32_t dir)
+{
+    return (dir > 0 ? to - from : from - to) & MASK;
+}
+static uint32_t span_mag(void) { return arc(R.expanded_raw, R.collapsed_raw, R.enc_dir); }
+
+// Raw angle -> u. The far side of the circle is folded negative, so "a bit past
+// expanded" reads as a small negative number rather than as nearly a full turn.
 static int64_t along(uint32_t raw)
 {
-    uint32_t u   = (R.enc_span > 0 ? raw - R.expanded_raw : R.expanded_raw - raw) & (ENCODER_CPR - 1);
+    uint32_t u   = arc(R.expanded_raw, raw, R.enc_dir);
     uint32_t mag = span_mag();
     if (u > mag + (ENCODER_CPR - mag) / 2)
         return (int64_t)u - (int64_t)ENCODER_CPR;
     return u;
 }
 
-static int32_t to_steps(int64_t u)
-{
-    return (int32_t)llround((double)u * R.span_steps / (double)span_mag());
-}
+static int64_t here(void) { return along(encoder_raw()); }
 
-// Motor position minus output position, for the side of the play the motor
-// last pushed on. Moving forward it leads the output by the play; moving
-// backward the two coincide. Which side is "forward" is arbitrary — what
-// matters is that it is used consistently.
-static int32_t contact(int8_t dir) { return dir > 0 ? R.backlash : 0; }
-
-static int32_t lo_steps(void) { return R.span_steps < 0 ? R.span_steps : 0; }
-static int32_t hi_steps(void) { return R.span_steps > 0 ? R.span_steps : 0; }
+// ESTIMATES, through the gear ratio. Never a position.
+static double  steps_per_count(void) { return encoder_gear() * stepper_steps_per_rev() / (double)ENCODER_CPR; }
+static int32_t est_steps(int64_t counts) { return (int32_t)llround((double)counts * steps_per_count()); }
+static int64_t est_counts(int32_t steps) { return (int64_t)llround((double)steps / steps_per_count()); }
 
 // "Inside" with the settle tolerance of slack: a shaft parked on an end sits a
 // count or two either side of it, and that is on the end, not past it.
-static bool inside_counts(int64_t u)
-{
-    const int64_t slack = (int64_t)(LIMIT_SETTLE_DEG / 360.0 * ENCODER_CPR);
-    return u >= -slack && u <= (int64_t)span_mag() + slack;
-}
-static bool inside_steps(int32_t p)  { return p >= lo_steps() && p <= hi_steps(); }
-
-// How far outside, in steps; 0 inside.
-static int32_t outside_by(int32_t p)
-{
-    if (p < lo_steps()) return lo_steps() - p;
-    if (p > hi_steps()) return p - hi_steps();
-    return 0;
-}
-
-// Which end sits at the low step count depends on which way max is from min.
-static const char *past_end(bool at_lo)
-{
-    bool min_at_lo = R.span_steps > 0;
-    return (at_lo == min_at_lo) ? "past expanded" : "past collapsed";
-}
-
-// Output degrees for a step figure, via the stored span — so it needs no gear
-// ratio and is right even if 'gear' is wrong.
-static double steps_deg(int32_t steps)
-{
-    return (double)steps * deg(span_mag()) / (double)abs(R.span_steps);
-}
-
-static int32_t axis_pos(void) { return stepper_pos() - contact(stepper_last_dir()) - s_origin; }
+static bool inside(int64_t u) { return u >= -SETTLE_COUNTS && u <= (int64_t)span_mag() + SETTLE_COUNTS; }
 
 static void say_where(int64_t u)
 {
-    if (inside_counts(u))
-        printf("shaft at %.2f deg from expanded (%ld steps), range %.2f deg — IN RANGE\n",
-               deg(u), (long)to_steps(u), deg(span_mag()));
+    if (inside(u))
+        printf("shaft at %.2f deg from expanded, range %.2f deg — IN RANGE\n",
+               deg(u), deg(span_mag()));
     else if (u < 0)
         printf("shaft is OUT OF RANGE: %.2f deg past expanded\n", -deg(u));
     else
         printf("shaft is OUT OF RANGE: %.2f deg past collapsed\n", deg(u - span_mag()));
+}
+
+// ---- learning the motor's direction --------------------------------------
+// Every motor move that turns the flap noticeably says which way positive
+// steps turn the encoder. The encoder task watches each move from start to
+// finish and keeps the answer. Calibration turns it into mot_dir; once
+// calibrated, a move that disagrees with the stored mot_dir corrects it.
+#define LEARN_MIN_COUNTS   ((int64_t)(0.5 / 360.0 * ENCODER_CPR))
+#define LEARN_MIN_STEPS    50
+static volatile int8_t  s_rel;          // +1: positive steps make the raw angle count up
+static bool             s_mv_on;
+static int64_t          s_mv_c0;
+static int32_t          s_mv_p0;
+
+static void learn_direction(void)
+{
+    bool busy = stepper_busy();
+    if (busy && !s_mv_on) {
+        s_mv_on = true;
+        s_mv_c0 = encoder_counts();
+        s_mv_p0 = stepper_pos();
+    } else if (!busy && s_mv_on) {
+        s_mv_on = false;
+        int64_t dc = encoder_counts() - s_mv_c0;
+        int32_t dp = stepper_pos() - s_mv_p0;
+        if ((dc > LEARN_MIN_COUNTS || dc < -LEARN_MIN_COUNTS) &&
+            (dp > LEARN_MIN_STEPS || dp < -LEARN_MIN_STEPS))
+            s_rel = ((dc > 0) == (dp > 0)) ? 1 : -1;
+    }
 }
 
 // ---- persistence ----------------------------------------------------------
@@ -157,7 +144,6 @@ static void say_where(int64_t u)
 // and nothing has changed for SETTINGS_QUIET_MS.
 static bool save(void)
 {
-    R.steps_per_rev = stepper_steps_per_rev();
     settings_mark_dirty();
     return true;
 }
@@ -169,25 +155,15 @@ void limits_init(void)
     if (!(R.flags & (F_EXPANDED | F_COLLAPSED)))
         R.approach_deg = LIMIT_APPROACH_DEG;
 
-    // span_steps was counted at one microstep setting; if the build or the
-    // MS pins changed, scale it — it is a ratio of two exact integers.
-    uint32_t spr = stepper_steps_per_rev();
-    if (calibrated() && R.steps_per_rev && R.steps_per_rev != spr) {
-        printf("[boot] limits: span rescaled from %lu to %lu steps/rev\n",
-               (unsigned long)R.steps_per_rev, (unsigned long)spr);
-        R.span_steps    = (int32_t)llround((double)R.span_steps * spr / R.steps_per_rev);
-        R.steps_per_rev = spr;
-        settings_mark_dirty();
-    }
     if (calibrated())
-        printf("[boot] limits: expanded raw %lu, collapsed raw %lu, %.2f deg = %ld steps, play %ld — motion bounded\n",
+        printf("[boot] limits: expanded raw %lu, collapsed raw %lu, %.2f deg, encoder %s, "
+               "motor %s to collapse, play %ld — motion bounded\n",
                (unsigned long)R.expanded_raw, (unsigned long)R.collapsed_raw,
-               deg(span_mag()), (long)R.span_steps, (long)R.backlash);
+               deg(span_mag()), R.enc_dir > 0 ? "counts up" : "counts down",
+               R.mot_dir > 0 ? "forward" : "backward", (long)R.backlash);
     else
-        printf("[boot] limits: NOT STORED (%s%s) — motor LOCKED and the DESK will not move.\n"
-               "       'calibrate' calibrates the flap.\n",
-               R.flags & F_EXPANDED ? "expanded stored" : "expanded missing",
-               R.flags & F_COLLAPSED ? ", collapsed stored" : ", collapsed missing");
+        printf("[boot] limits: NOT CALIBRATED — motor LOCKED and the DESK will not move.\n"
+               "       'calibrate' calibrates the flap.\n");
 }
 
 lim_mode_t limits_mode(void)
@@ -197,8 +173,8 @@ lim_mode_t limits_mode(void)
     return LIM_LOCKED;
 }
 
-bool limits_calibrated(void) { return calibrated(); }
-int32_t limits_span_steps(void) { return R.span_steps; }
+bool   limits_calibrated(void) { return calibrated(); }
+double limits_range_deg(void)  { return calibrated() ? deg(span_mag()) : 0.0; }
 
 void limits_set_free(bool on)
 {
@@ -210,68 +186,27 @@ void limits_set_free(bool on)
         printf("free motion off — %s\n", calibrated() ? "range enforced again" : "motion locked (not calibrated)");
 }
 
-// ---- sync ----------------------------------------------------------------
-
-static bool sync_now(bool verbose)
-{
-    if (!calibrated() || !encoder_available())
-        return false;
-    int64_t u = along(encoder_raw());
-    s_origin     = stepper_pos() - contact(stepper_last_dir()) - to_steps(u);
-    s_origin_gen = stepper_pos_gen();
-    s_synced     = true;
-    if (verbose)
-        say_where(u);
-    return true;
-}
-
-bool limits_sync(bool verbose)
-{
-    if (!calibrated()) {
-        if (verbose) printf("not calibrated — nothing to sync to\n");
-        return false;
-    }
-    if (!encoder_available()) {
-        if (verbose) printf("no encoder — cannot place the shaft in the range. 'enc' for why.\n");
-        return false;
-    }
-    return sync_now(verbose);
-}
-
-// Before a move: make sure the step axis agrees with the angle. Returns the
-// axis position in counts (absolute) and leaves axis_pos() consistent with it.
-static int64_t reconcile(void)
-{
-    int64_t u = along(encoder_raw());
-    if (!s_synced || s_origin_gen != stepper_pos_gen()) {
-        sync_now(false);
-        return u;
-    }
-    int32_t p_step = axis_pos();
-    int32_t p_enc  = to_steps(u);
-    int64_t diff_c = (int64_t)llround((double)(p_step - p_enc) * (double)span_mag() / (double)abs(R.span_steps));
-    if (diff_c > RESYNC_COUNTS || diff_c < -RESYNC_COUNTS) {
-        printf("position re-seeded from the encoder: the step counter was %+.2f deg off\n"
-               "  (lost steps, or the shaft was moved by hand)\n", deg(diff_c));
-        sync_now(false);
-    }
-    return u;
-}
-
 // ---- the gate ---------------------------------------------------------------
 
-static bool refuse_outside(int32_t target, int32_t p)
+static bool refuse_locked(void)
 {
-    int32_t over = outside_by(target);
-    printf("refused: would end %.2f deg %s (range %.2f deg, now %.2f deg from expanded)\n",
-           steps_deg(over), past_end(target < lo_steps()), deg(span_mag()),
-           steps_deg(p - lo_steps()));
+    printf("refused: NOT CALIBRATED — so nothing may move but a jog.\n"
+           "  'calibrate' stores the ends; 'mot jog <steps>' jogs in small steps.\n");
     return false;
 }
 
-static int32_t approach_steps(void)
+static bool refuse_no_encoder(void)
 {
-    return (int32_t)llround((double)R.approach_deg / deg(span_mag()) * (double)abs(R.span_steps));
+    printf("refused: no encoder — cannot tell where the shaft is in the range. 'enc' for why.\n");
+    return false;
+}
+
+static bool refuse_outside(int64_t target, int64_t u)
+{
+    printf("refused: would end %.2f deg %s (range %.2f deg, now %.2f deg from expanded)\n",
+           target < 0 ? -deg(target) : deg(target - span_mag()),
+           target < 0 ? "past expanded" : "past collapsed", deg(span_mag()), deg(u));
+    return false;
 }
 
 bool limits_set_approach(double degrees)
@@ -285,25 +220,10 @@ bool limits_set_approach(double degrees)
         return false;
     }
     R.approach_deg = (float)degrees;
-    if (!save()) {
-        printf("flash write FAILED\n");
-        return false;
-    }
-    if (degrees == 0.0)
-        printf("approach 0: targeted moves run the whole distance by step count, then the\n"
-               "  encoder checks and creeps back if off. A gap the load holds open on one\n"
-               "  side WILL carry the shaft past an end by that gap first. Saved.\n");
-    else
-        printf("approach %.1f deg: the last %.1f deg of every targeted move is crept under\n"
-               "  the encoder. Saved.\n", degrees, degrees);
+    save();
+    printf("approach %.1f deg: an encoder-steered move ramps down to stop this far short\n"
+           "  of its target, and the creep finishes it. Saved.\n", degrees);
     return true;
-}
-
-static bool refuse_locked(void)
-{
-    printf("refused: NOT CALIBRATED — no ends stored, so nothing may move.\n"
-           "  'mot jog <steps>' jogs in small steps; 'lim expanded' / 'lim collapsed' store the ends.\n");
-    return false;
 }
 
 static bool start_raw(int32_t steps, bool bypass, bool compensate)
@@ -330,22 +250,163 @@ bool limits_move(int32_t steps)
         return start(steps, true);
     if (!calibrated())
         return refuse_locked();
-    if (!encoder_available()) {
-        printf("refused: no encoder — cannot tell where the shaft is in the range. 'enc' for why.\n");
-        return false;
-    }
+    if (!encoder_available())
+        return refuse_no_encoder();
     if (stepper_busy()) {
         printf("busy — ignored\n");
         return false;
     }
-    int64_t u      = reconcile();
-    int32_t p      = axis_pos();
-    int32_t target = p + steps;
-    if (!inside_steps(target))
-        return refuse_outside(target, p);
+    int64_t u      = here();
+    int64_t target = u + est_counts(steps) * (R.mot_dir > 0 ? 1 : -1);
+    if (!inside(target))
+        return refuse_outside(target, u);
     // A move that starts outside — after a hand turn, say — and ends inside is
     // the way back in, and the guard would stop it on its first sample.
-    return start(steps, !inside_counts(u));
+    return start(steps, !inside(u));
+}
+
+bool limits_jog(int32_t steps)
+{
+    int32_t cap = (int32_t)stepper_steps_per_rev();
+    if (steps == 0)
+        return true;
+    if (steps > cap || steps < -cap) {
+        printf("jog is capped at %ld steps (one motor revolution) per command\n", (long)cap);
+        return false;
+    }
+    s_have_target = false;
+    if (s_free || !calibrated())
+        return start(steps, true);          // finding the ends: no range to check yet
+
+    if (!encoder_available())
+        return refuse_no_encoder();
+    if (stepper_busy()) {
+        printf("busy — ignored\n");
+        return false;
+    }
+    int64_t u      = here();
+    int64_t target = u + est_counts(steps) * (R.mot_dir > 0 ? 1 : -1);
+    if (inside(u)) {
+        if (!inside(target))
+            return refuse_outside(target, u);
+        return start(steps, false);
+    }
+    // Outside: only towards the range, and never through it to the far side.
+    bool home = u < 0 ? (target > u && target <= (int64_t)span_mag())
+                      : (target < u && target >= 0);
+    if (!home) {
+        printf("refused: the shaft is %.2f deg %s and this jog does not bring it back\n",
+               u < 0 ? -deg(u) : deg(u - span_mag()), u < 0 ? "past expanded" : "past collapsed");
+        return false;
+    }
+    return start(steps, true);
+}
+
+// ---- the encoder-steered run ------------------------------------------------
+// The motor runs continuously towards the target; limits_guard(), on every
+// encoder sample, works out how far it is still to go and how far the motor
+// needs to brake from its present speed, and ramps it down when the two meet —
+// lim_approach_deg short of the target. It also stops it hard if the flap is
+// not following (a stall) or goes the wrong way (a wrong mot_dir).
+#define RUN_PROGRESS_DEG   0.2      // must gain at least this ...
+#define RUN_PROGRESS_MS    400      // ... in this long, or it is a stall
+#define RUN_AWAY_DEG       1.0      // further from the target than at the start
+
+enum { FAULT_NONE, FAULT_STALL, FAULT_WRONG_WAY };
+
+static volatile bool       s_run;
+static volatile int64_t    s_run_target;
+static volatile int8_t     s_run_sense;     // +1: u must increase
+static volatile int64_t    s_run_best;      // least distance still to go so far
+static volatile int64_t    s_run_start;     // distance at the start
+static volatile TickType_t s_run_best_at;
+static volatile uint8_t    s_fault;         // set by the encoder task, said by the console
+
+static int64_t approach_counts(void) { return counts_of((double)R.approach_deg); }
+
+static void steer(int64_t u)
+{
+    if (!s_run)
+        return;
+    if (!stepper_busy()) {                  // ended some other way: 'stop', the guard
+        s_run = false;
+        return;
+    }
+    int64_t left = (s_run_target - u) * s_run_sense;
+
+    // Braking distance from the present speed, v^2 / 2a, as encoder counts.
+    double v      = (double)stepper_cur_sps();
+    double brake  = v * v / (2.0 * (double)stepper_accel());
+    int64_t stop_at = est_counts((int32_t)brake) + approach_counts();
+    if (left <= stop_at) {
+        stepper_stop();                     // ramped: lands about approach short
+        s_run = false;
+        return;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    if (left < s_run_best - counts_of(RUN_PROGRESS_DEG)) {
+        s_run_best    = left;
+        s_run_best_at = now;
+    } else if (now - s_run_best_at > pdMS_TO_TICKS(RUN_PROGRESS_MS)) {
+        stepper_stop_hard();
+        s_run   = false;
+        s_fault = left > s_run_start + counts_of(RUN_AWAY_DEG) ? FAULT_WRONG_WAY : FAULT_STALL;
+    }
+}
+
+bool limits_goto_deg(double deg_from_expanded)
+{
+    if (!calibrated())
+        return refuse_locked();
+    if (!encoder_available())
+        return refuse_no_encoder();
+    if (stepper_busy()) {
+        printf("busy — ignored\n");
+        return false;
+    }
+    int64_t u      = here();
+    int64_t target = counts_of(deg_from_expanded);
+    // Under 'lim free' the ends are still the axis's landmarks, just not walls.
+    if (!s_free && !inside(target))
+        return refuse_outside(target, u);
+
+    s_target      = target;
+    s_from        = u;
+    s_have_target = true;
+    int64_t dist  = target - u;
+    int64_t mag   = dist < 0 ? -dist : dist;
+
+    if (mag <= approach_counts()) {
+        printf("going to %.2f deg from expanded: %.2f deg away — crept under the encoder\n",
+               deg(target), deg(dist));
+        return true;                        // limits_settle() does all of it
+    }
+    printf("going to %.2f deg from expanded: %+.2f deg, steered by the encoder, the last\n"
+           "  %.1f deg crept\n", deg(target), deg(dist), (double)R.approach_deg);
+
+    s_run_target  = target;
+    s_run_sense   = dist > 0 ? 1 : -1;
+    s_run_best    = mag;
+    s_run_start   = mag;
+    s_run_best_at = xTaskGetTickCount();
+    s_fault       = FAULT_NONE;
+    s_bypass      = !inside(u);
+    bool forward  = (s_run_sense > 0) == (R.mot_dir > 0);
+    // The motor first, THEN the steering: the encoder task ends a run it finds
+    // the motor idle for, and it can run between these two lines.
+    if (!stepper_run(forward)) {
+        s_have_target = false;
+        printf("busy — ignored\n");
+        return false;
+    }
+    s_run = true;
+    return true;
+}
+
+bool limits_goto_end(bool collapsed)
+{
+    return limits_goto_deg(collapsed ? deg(span_mag()) : 0.0);
 }
 
 bool limits_run(bool forward)
@@ -359,125 +420,27 @@ bool limits_run(bool forward)
     }
     if (!calibrated())
         return refuse_locked();
-    if (!encoder_available()) {
-        printf("refused: no encoder — cannot tell where the shaft is in the range. 'enc' for why.\n");
-        return false;
-    }
-    if (stepper_busy()) {
-        printf("busy — ignored\n");
-        return false;
-    }
-    int32_t target = forward ? hi_steps() : lo_steps();
-    printf("running %s to %s\n", forward ? "forward" : "backward",
-           target == R.span_steps ? "collapsed" : "expanded");
-    return limits_goto(target);
+    bool collapsed = forward == (R.mot_dir > 0);
+    printf("running %s to %s\n", forward ? "forward" : "backward", collapsed ? "collapsed" : "expanded");
+    return limits_goto_end(collapsed);
 }
 
-bool limits_jog(int32_t steps)
-{
-    int32_t cap = (int32_t)stepper_steps_per_rev();
-    if (steps == 0)
-        return true;
-    if (steps > cap || steps < -cap) {
-        printf("jog is capped at %ld steps (one motor revolution) per command\n", (long)cap);
-        return false;
-    }
-    if (s_free || !calibrated())
-        return start(steps, true);          // finding the ends: no range to check yet
-
-    if (!encoder_available()) {
-        printf("refused: no encoder — cannot tell where the shaft is in the range. 'enc' for why.\n");
-        return false;
-    }
-    if (stepper_busy()) {
-        printf("busy — ignored\n");
-        return false;
-    }
-    int64_t u = reconcile();
-    int32_t p = axis_pos();
-    if (inside_counts(u))
-        return limits_goto(p + steps);          // targeted, like any bounded move
-
-    // Outside: only towards the range, and never through it to the far side.
-    bool    below = p < lo_steps();
-    int32_t t     = p + steps;
-    bool    home  = below ? (t > p && t <= hi_steps()) : (t < p && t >= lo_steps());
-    if (!home) {
-        printf("refused: the shaft is %.2f deg %s and this jog does not bring it back —\n"
-               "  jog %s, and not past the far end\n",
-               steps_deg(outside_by(p)), past_end(below), below ? "forward (+)" : "backward (-)");
-        return false;
-    }
-    return start(steps, true);
-}
-
-bool limits_goto(int32_t axis_steps)
-{
-    if (!calibrated())
-        return refuse_locked();
-    if (!encoder_available()) {
-        printf("refused: no encoder — cannot tell where the shaft is in the range. 'enc' for why.\n");
-        return false;
-    }
-    if (stepper_busy()) {
-        printf("busy — ignored\n");
-        return false;
-    }
-    int64_t u = reconcile();
-    int32_t p = axis_pos();
-    // Under 'lim free' the ends are still the axis's landmarks, just not walls.
-    if (!s_free && !inside_steps(axis_steps))
-        return refuse_outside(axis_steps, p);
-
-    int32_t steps  = axis_steps - p;
-    int32_t margin = approach_steps();
-    s_target       = axis_steps;
-    s_have_target  = true;
-
-    // Open-loop only to `margin` short of the target; limits_settle() creeps
-    // the rest with the encoder, so the shaft arrives from inside and the
-    // load cannot carry it past.
-    int32_t run = 0;
-    if (steps > margin)       run = steps - margin;
-    else if (steps < -margin) run = steps + margin;
-
-    if (margin)
-        printf("going to %ld (%.2f deg from expanded): %+ld steps, the last %.1f deg under the encoder\n",
-               (long)axis_steps, steps_deg(axis_steps), (long)steps,
-               run ? (double)R.approach_deg : steps_deg(steps < 0 ? -steps : steps));
-    else
-        printf("going to %ld (%.2f deg from expanded): %+ld steps by count, then checked\n",
-               (long)axis_steps, steps_deg(axis_steps), (long)steps);
-    if (run && !start(run, !inside_counts(u))) {
-        s_have_target = false;
-        return false;
-    }
-    return true;
-}
-
+// ---- the creep --------------------------------------------------------------
 // The encoder finishes the move. Near a point where the load torque changes
 // sign the output floats in the play, so where it landed is only known once
-// it has stopped; measure, and move by the difference. The origin is
-// re-seeded first so the correction is made in the shaft's own terms.
+// it has stopped; measure, and move by the difference.
 #define SETTLE_INC_COARSE   32      // creep increment while more than SETTLE_COARSE_FROM off
 #define SETTLE_COARSE_FROM  64      // microsteps — under a degree of shaft on this rig
 #define SETTLE_INC          8       // creep increment near the target
 #define SETTLE_INC_FINE     2       // after an overshoot
 #define SETTLE_PAUSE_MS     30      // for the load to come to rest after each
+#define SETTLE_DIVERGE_DEG  2.0     // further off than at the start by this: give up
 
-static int32_t creep_inc(int32_t err, bool overshot)
+static int32_t creep_inc(int64_t err, bool overshot)
 {
     if (overshot) return SETTLE_INC_FINE;
-    int32_t mag = err < 0 ? -err : err;
+    int32_t mag = est_steps(err < 0 ? -err : err);
     return mag > SETTLE_COARSE_FROM ? SETTLE_INC_COARSE : SETTLE_INC;
-}
-
-static int32_t settle_error(int64_t *u_out)
-{
-    int64_t u = along(encoder_raw());
-    sync_now(false);
-    *u_out = u;
-    return s_target - to_steps(u);
 }
 
 int limits_settle(double *err_deg, int32_t *crept)
@@ -486,13 +449,10 @@ int limits_settle(double *err_deg, int32_t *crept)
     *crept   = 0;
     if (!s_have_target || s_free || !calibrated() || !encoder_available() || stepper_busy())
         return -1;
-    int32_t tol = (int32_t)llround(LIMIT_SETTLE_DEG / deg(span_mag()) * (double)abs(R.span_steps));
-    if (tol < 1) tol = 1;
 
-    int64_t u;
-    int32_t err = settle_error(&u);
-    *err_deg = steps_deg(err);
-    if (err <= tol && err >= -tol)
+    int64_t err = s_target - here();
+    *err_deg = deg(err);
+    if (err <= SETTLE_COUNTS && err >= -SETTLE_COUNTS)
         return 0;
 
     // Creep toward the target. The increment is never lengthened by the play
@@ -500,33 +460,39 @@ int limits_settle(double *err_deg, int32_t *crept)
     // output starts to follow — and drops to a fine step once the error has
     // changed sign, so an overshoot comes back without ringing. A gap cannot
     // exceed a motor revolution, so that plus the error is the budget.
-    int32_t cap = (err < 0 ? -err : err) + (int32_t)stepper_steps_per_rev();
-    bool    overshot = false;
-    bool    bypass   = !inside_counts(u);
+    int64_t start_err = err < 0 ? -err : err;
+    int32_t cap       = est_steps(start_err) * 2 + (int32_t)stepper_steps_per_rev();
+    bool    overshot  = false;
+    bool    bypass    = !inside(here());
     while (*crept < cap) {
-        int8_t  dir = err > 0 ? 1 : -1;
         int32_t inc = creep_inc(err, overshot);
+        int32_t dir = (err > 0) == (R.mot_dir > 0) ? 1 : -1;
         if (!start_raw(dir * inc, bypass, false) || !stepper_wait(1000))
             return 1;
         *crept += inc;
         vTaskDelay(pdMS_TO_TICKS(SETTLE_PAUSE_MS));
-        int32_t next = settle_error(&u);
-        *err_deg = steps_deg(next);
-        if (next <= tol && next >= -tol)
+        int64_t next = s_target - here();
+        *err_deg = deg(next);
+        if (next <= SETTLE_COUNTS && next >= -SETTLE_COUNTS)
             return 0;
-        if ((int64_t)next * err < 0)
+        if ((next < 0 ? -next : next) > start_err + counts_of(SETTLE_DIVERGE_DEG))
+            return 1;                           // going the wrong way: stop, say so
+        if ((next > 0) != (err > 0))
             overshot = true;                    // crossed the target: come back gently
         err = next;
     }
     return 1;
 }
 
-bool limits_near_target(double max_deg)
+double limits_progress(void)
 {
     if (!s_have_target || !calibrated() || !encoder_available())
-        return false;
-    int32_t err = s_target - to_steps(along(encoder_raw()));
-    return steps_deg(err < 0 ? -err : err) <= max_deg;
+        return -1.0;
+    int64_t total = s_target - s_from;
+    if (total == 0)
+        return 1.0;
+    double p = (double)(here() - s_from) / (double)total;
+    return p < 0.0 ? 0.0 : p > 1.0 ? 1.0 : p;
 }
 
 #define AT_END_DEG  3.0
@@ -534,7 +500,7 @@ bool limits_at_end(bool collapsed)
 {
     if (!calibrated() || !encoder_available())
         return false;
-    int64_t u    = along(encoder_raw());
+    int64_t u    = here();
     int64_t end  = collapsed ? (int64_t)span_mag() : 0;
     int64_t off  = u > end ? u - end : end - u;
     return deg(off) <= AT_END_DEG;
@@ -544,87 +510,35 @@ int limits_nearer_end(void)
 {
     if (!calibrated() || !encoder_available())
         return -1;
-    return along(encoder_raw()) * 2 > (int64_t)span_mag() ? 1 : 0;
-}
-
-bool limits_goto_end(bool to_max)
-{
-    return limits_goto(to_max ? R.span_steps : 0);
+    return here() * 2 > (int64_t)span_mag() ? 1 : 0;
 }
 
 // ---- calibration ------------------------------------------------------------
 
-static bool finish_calibration(void)
+// Move one end of an existing range to where the shaft is now. The direction
+// of travel is already known, so the other end stays as it is.
+static bool remark(bool collapsed)
 {
-    int64_t enc  = s_max_mark.counts - s_min_mark.counts;
-    // Output positions, not motor positions: an end reached going forward has
-    // the play between motor and output, one reached going backward has not.
-    int32_t span = (s_max_mark.pos - contact(s_max_mark.dir)) - (s_min_mark.pos - contact(s_min_mark.dir));
-
-    if (enc == 0 || span == 0) {
-        printf("expanded and collapsed are the same place — jog between them first\n");
-        return false;
-    }
-    if (enc >= (int64_t)ENCODER_CPR - 2 * GUARD_COUNTS || enc <= -((int64_t)ENCODER_CPR - 2 * GUARD_COUNTS)) {
-        printf("the range spans %.1f deg of the measured shaft — it must fit inside one\n"
-               "  turn, with %.1f deg to spare at each end for the guard. Not stored.\n",
-               deg(enc < 0 ? -enc : enc), LIMIT_GUARD_DEG);
-        return false;
-    }
-    R.enc_span   = (int32_t)enc;
-    R.span_steps = span;
-    R.flags      = F_EXPANDED | F_COLLAPSED;
-
-    // Sanity, not a gate: the two spans should agree with the gear ratio. A
-    // big disagreement means steps were lost while jogging, or the magnet is
-    // not on the shaft the motor drives.
-    double expect = deg(enc < 0 ? -enc : enc) / 360.0 * encoder_gear() * stepper_steps_per_rev();
-    double ratio  = (double)abs(span) / expect;
-    if (ratio < 0.8 || ratio > 1.25)
-        printf("  WARNING: %ld steps for %.2f deg is %.0f%% of what gear %.4g predicts —\n"
-               "  lost steps while jogging, or the magnet is not on the driven shaft?\n",
-               (long)abs(span), deg(enc < 0 ? -enc : enc), 100.0 * ratio, encoder_gear());
-    return true;
-}
-
-// Move one end of an existing range to where the shaft is now. The axis is
-// already known — the step counter is seeded from the angle — so the new span
-// is simply the current position: from min for a new max, and the old span
-// less the current position for a new min. A range can only shrink this way
-// from inside it; to push an end outward, 'lim free', jog past it, then mark.
-static bool remark(bool is_max)
-{
-    int64_t u = reconcile();                    // counts from min, and axis_pos() agrees
-    int32_t p = axis_pos();
-    int64_t u_signed = R.enc_span > 0 ? u : -u;   // back to raw counting direction
-    int64_t enc  = is_max ? u_signed : R.enc_span - u_signed;
-    int32_t span = is_max ? p : R.span_steps - p;
-
-    if (enc == 0 || span == 0) {
+    uint32_t raw = encoder_raw();
+    uint32_t e   = collapsed ? R.expanded_raw : raw;
+    uint32_t c   = collapsed ? raw : R.collapsed_raw;
+    uint32_t mag = arc(e, c, R.enc_dir);
+    if (mag == 0) {
         printf("the shaft is on the other end — nothing between them\n");
         return false;
     }
-    int64_t lim = (int64_t)ENCODER_CPR - 2 * GUARD_COUNTS;
-    if (enc >= lim || enc <= -lim) {
-        printf("that would make the range %.1f deg — it must fit inside one turn\n",
-               deg(enc < 0 ? -enc : enc));
+    if ((int64_t)mag >= (int64_t)ENCODER_CPR - 2 * GUARD_COUNTS) {
+        printf("that would make the range %.1f deg — it must fit inside one turn\n", deg(mag));
         return false;
     }
-    if (is_max) R.collapsed_raw = encoder_raw(); else R.expanded_raw = encoder_raw();
-    R.enc_span   = (int32_t)enc;
-    R.span_steps = span;
-    if (!save()) {
-        printf("flash write FAILED\n");
-        return false;
-    }
-    sync_now(false);
-    printf("%s moved here: range now %.2f deg = %ld steps, %s. Saved.\n",
-           is_max ? "collapsed" : "expanded", deg(span_mag()), (long)R.span_steps,
-           R.span_steps > 0 ? "collapsed is forward of expanded" : "collapsed is backward of expanded");
+    if (collapsed) R.collapsed_raw = raw; else R.expanded_raw = raw;
+    save();
+    printf("%s moved here: range now %.2f deg. Saved.\n",
+           collapsed ? "collapsed" : "expanded", deg(span_mag()));
     return true;
 }
 
-bool limits_mark(bool is_max)
+bool limits_mark(bool collapsed)
 {
     if (stepper_busy()) {
         printf("stop first\n");
@@ -635,124 +549,66 @@ bool limits_mark(bool is_max)
         return false;
     }
     if (calibrated())
-        return remark(is_max);
-    mark_t *mine  = is_max ? &s_max_mark : &s_min_mark;
-    mark_t *other = is_max ? &s_min_mark : &s_max_mark;
-    uint32_t oflag = is_max ? F_EXPANDED : F_COLLAPSED;
+        return remark(collapsed);
+
+    mark_t  *mine  = collapsed ? &s_col_mark : &s_exp_mark;
+    mark_t  *other = collapsed ? &s_exp_mark : &s_col_mark;
+    uint32_t oflag = collapsed ? F_EXPANDED : F_COLLAPSED;
+    const char *me = collapsed ? "collapsed" : "expanded", *them = collapsed ? "expanded" : "collapsed";
 
     mine->session = true;
     mine->counts  = encoder_counts();
-    mine->pos     = stepper_pos();
-    mine->dir     = stepper_last_dir();
-    mine->sgen    = stepper_pos_gen();
     mine->egen    = encoder_zero_gen();
     uint32_t raw  = encoder_raw();
-    if (is_max) R.collapsed_raw = raw; else R.expanded_raw = raw;
-    R.flags |= is_max ? F_COLLAPSED : F_EXPANDED;
-
-    printf("%s stored: raw %lu (%.3f deg)\n", is_max ? "collapsed" : "expanded",
-           (unsigned long)raw, (double)raw * 360.0 / ENCODER_CPR);
-    if (!R.backlash && !(R.flags & oflag))
-        printf("  no play stored — if the gearbox has backlash, 'reset' then 'lim play' first\n");
+    if (collapsed) R.collapsed_raw = raw; else R.expanded_raw = raw;
+    R.flags |= collapsed ? F_COLLAPSED : F_EXPANDED;
+    printf("%s stored: raw %lu (%.3f deg)\n", me, (unsigned long)raw, (double)raw * 360.0 / ENCODER_CPR);
 
     if (R.flags & oflag) {
-        bool ok;
-        if (!other->session) {
-            printf("  %s was stored in an earlier session, so the steps between the ends\n"
-                   "  cannot be counted — jog there and '%s' again\n",
-                   is_max ? "expanded" : "collapsed", is_max ? "lim expanded" : "lim collapsed");
-            ok = false;
-        } else if (other->sgen != mine->sgen || other->egen != mine->egen) {
-            printf("  a counter was zeroed or hard-stopped since %s was stored — jog\n"
-                   "  there and '%s' again\n",
-                   is_max ? "expanded" : "collapsed", is_max ? "lim expanded" : "lim collapsed");
-            ok = false;
+        bool ok = false;
+        if (!other->session || other->egen != mine->egen) {
+            printf("  %s was stored in an earlier session, or the encoder was zeroed since —\n"
+                   "  the way round between the ends is not known. Go there and store it again.\n", them);
         } else {
-            ok = finish_calibration();
+            // Which way round the flap went from expanded to collapsed: the
+            // continuous count between the marks says, and it must match one
+            // of the two arcs the stored angles make.
+            int64_t dc  = collapsed ? mine->counts - other->counts : other->counts - mine->counts;
+            int32_t dir = dc > 0 ? 1 : -1;
+            int64_t mag = dc > 0 ? dc : -dc;
+            int64_t a   = arc(R.expanded_raw, R.collapsed_raw, dir);
+            if (mag == 0 || a == 0) {
+                printf("  expanded and collapsed are the same place — move between them first\n");
+            } else if (mag >= (int64_t)ENCODER_CPR - 2 * GUARD_COUNTS) {
+                printf("  the range spans %.1f deg of the measured shaft — it must fit inside one\n"
+                       "  turn, with %.1f deg to spare at each end for the guard. Not stored.\n",
+                       deg(mag), LIMIT_GUARD_DEG);
+            } else if (s_rel == 0) {
+                printf("  the motor's direction is not known yet — it is learned while the motor\n"
+                       "  turns the flap. 'mot jog' it at least once (more than half a degree).\n");
+            } else {
+                R.enc_dir = dir;
+                R.mot_dir = s_rel * dir;    // steps that make u grow
+                ok = true;
+            }
         }
         if (!ok) {
-            R.flags &= ~oflag;      // keep only this end
+            R.flags &= ~oflag;              // keep only this end
             other->session = false;
         }
     }
 
-    if (!save()) {
-        printf("  flash write FAILED\n");
-        return false;
-    }
+    save();
     if (calibrated()) {
-        printf("CALIBRATED: %.2f deg of travel = %ld steps, %s. Saved.\n"
-               "  'mot go expanded' / 'mot go collapsed' move between the ends; 'lim' shows where you are.\n",
-               deg(span_mag()), (long)R.span_steps,
-               R.span_steps > 0 ? "collapsed is forward of expanded" : "collapsed is backward of expanded");
-        sync_now(false);
+        printf("CALIBRATED: %.2f deg of travel, the encoder %s and the motor turning %s\n"
+               "  to collapse. Saved. 'mot go expanded' / 'mot go collapsed' move between\n"
+               "  the ends; 'lim' shows where you are.\n",
+               deg(span_mag()), R.enc_dir > 0 ? "counting up" : "counting down",
+               R.mot_dir > 0 ? "forward" : "backward");
     } else {
-        printf("  saved. Jog to the other end and 'lim %s'.\n", is_max ? "expanded" : "collapsed");
+        printf("  saved. Move to the other end and store it.\n");
     }
     return true;
-}
-
-bool limits_set_span(int32_t steps)
-{
-    if (!calibrated()) {
-        printf("no range stored — 'lim expanded' / 'lim collapsed' first\n");
-        return false;
-    }
-    if (stepper_busy()) {
-        printf("stop first\n");
-        return false;
-    }
-    if (steps == 0 || (steps > 0) != (R.span_steps > 0)) {
-        printf("span must keep its sign: collapsed is %s of expanded, so %s\n",
-               R.span_steps > 0 ? "forward" : "backward",
-               R.span_steps > 0 ? "positive" : "negative");
-        return false;
-    }
-    int32_t old = R.span_steps;
-    R.span_steps = steps;
-    if (!save()) {
-        R.span_steps = old;
-        printf("flash write FAILED\n");
-        return false;
-    }
-    sync_now(false);
-    printf("span %ld -> %ld steps for %.2f deg (%.1f steps/deg). Saved.\n",
-           (long)old, (long)steps, deg(span_mag()), (double)abs(steps) / deg(span_mag()));
-    return true;
-}
-
-bool limits_store_span(void)
-{
-    if (!calibrated()) {
-        printf("no range stored — 'lim expanded' / 'lim collapsed' first\n");
-        return false;
-    }
-    if (!encoder_available()) {
-        printf("no encoder — cannot tell where the shaft is. 'enc' for why.\n");
-        return false;
-    }
-    if (stepper_busy()) {
-        printf("stop first\n");
-        return false;
-    }
-    if (!s_synced || s_origin_gen != stepper_pos_gen()) {
-        printf("the step counter is not seeded — 'mot go expanded' then 'mot go collapsed' first\n");
-        return false;
-    }
-    int64_t u   = along(encoder_raw());
-    int64_t tol = (int64_t)(LIMIT_SETTLE_DEG / 360.0 * ENCODER_CPR);
-    if (u < (int64_t)span_mag() - tol || u > (int64_t)span_mag() + tol) {
-        printf("the shaft is %.2f deg from expanded, not at collapsed — 'mot go collapsed' first, then this\n", deg(u));
-        return false;
-    }
-    int32_t p = axis_pos();
-    if (p == 0 || (p > 0) != (R.span_steps > 0)) {
-        printf("the step counter reads %ld from expanded — not a span. 'mot go expanded', 'mot go collapsed', then this\n", (long)p);
-        return false;
-    }
-    printf("shaft at collapsed (%.3f deg from it); step counter says %ld from expanded\n",
-           deg(u - (int64_t)span_mag()), (long)p);
-    return limits_set_span(p);
 }
 
 bool limits_clear(void)
@@ -765,14 +621,14 @@ bool limits_clear(void)
     // depend on. Backlash and approach are properties of the gearbox and of
     // taste, still true after the ends move, so they stay.
     R.flags         = 0;
-    R.expanded_raw       = 0;
-    R.collapsed_raw       = 0;
-    R.enc_span      = 0;
-    R.span_steps    = 0;
-    R.steps_per_rev = 0;
+    R.expanded_raw  = 0;
+    R.collapsed_raw = 0;
+    R.enc_dir       = 0;
+    R.mot_dir       = 0;
+    R.reserved      = 0;
     settings_mark_dirty();
-    s_min_mark = s_max_mark = (mark_t){ 0 };
-    s_synced = false;
+    s_exp_mark = s_col_mark = (mark_t){ 0 };
+    s_have_target = false;
     printf("flap calibration cleared — the motor only jogs and the DESK will not\n"
            "  move until both ends are stored again. Backlash %ld and approach\n"
            "  %.1f deg kept.\n",
@@ -873,10 +729,6 @@ bool limits_set_play(int32_t steps)
         printf("stop first\n");
         return false;
     }
-    if (calibrated()) {
-        printf("the stored span was measured with the play as it was — 'reset' first\n");
-        return false;
-    }
     if (steps < 0 || steps > (int32_t)stepper_steps_per_rev()) {
         printf("play must be 0..%lu microsteps\n", (unsigned long)stepper_steps_per_rev());
         return false;
@@ -902,10 +754,6 @@ bool limits_measure_play(double move_deg)
     }
     if (!encoder_available()) {
         printf("no encoder — cannot see the output move. 'enc' for why.\n");
-        return false;
-    }
-    if (calibrated()) {
-        printf("the stored span was measured with the play as it was — 'reset' first\n");
         return false;
     }
     // The play cannot exceed a motor turn; the motion asked for comes on top.
@@ -975,71 +823,62 @@ bool limits_measure_play(double move_deg)
 
 // ---- reporting --------------------------------------------------------------
 
-// The flash record, field by field, exactly as stored — no derivation.
-static void dump_record(void)
+void limits_report(void)
 {
-    printf("  stored: flags 0x%lx (%s%s) | expanded_raw %lu | collapsed_raw %lu | enc_span %ld | span_steps %ld | steps_per_rev %lu | play %ld | approach %.1f deg\n",
+    printf("  stored: flags 0x%lx (%s%s) | expanded_raw %lu | collapsed_raw %lu | enc_dir %+ld"
+           " | mot_dir %+ld | play %ld | approach %.1f deg\n",
            (unsigned long)R.flags,
            R.flags & F_EXPANDED ? "expanded" : "-", R.flags & F_COLLAPSED ? "+collapsed" : "",
            (unsigned long)R.expanded_raw, (unsigned long)R.collapsed_raw,
-           (long)R.enc_span, (long)R.span_steps,
-           (unsigned long)R.steps_per_rev, (long)R.backlash, (double)R.approach_deg);
-}
-
-void limits_report(void)
-{
-    dump_record();
+           (long)R.enc_dir, (long)R.mot_dir, (long)R.backlash, (double)R.approach_deg);
     if (!calibrated()) {
         printf("limits: NOT CALIBRATED — expanded %s, collapsed %s. Motor LOCKED%s, desk LOCKED.\n",
                R.flags & F_EXPANDED ? "stored" : "missing",
                R.flags & F_COLLAPSED ? "stored" : "missing",
                s_free ? " (overridden by 'lim free')" : "");
-        if (R.flags & F_EXPANDED)
-            printf("  expanded raw %lu%s\n", (unsigned long)R.expanded_raw,
-                   s_min_mark.session ? "" : " (earlier session — store it again)");
-        if (R.flags & F_COLLAPSED)
-            printf("  collapsed raw %lu%s\n", (unsigned long)R.collapsed_raw,
-                   s_max_mark.session ? "" : " (earlier session — store it again)");
-        printf("  play %ld microsteps%s\n", (long)R.backlash,
-               R.backlash ? "" : " — 'lim play [deg]' measures it, 'eeprom set lim_backlash <n>' sets it");
-        printf("  'calibrate' walks through it. By hand: 'mot jog <steps>' to an end, 'lim expanded';\n"
-               "  'mot jog' to the other, 'lim collapsed'. Both in one session, no zero or halt in\n"
-               "  between. The range must fit in one turn.\n");
+        printf("  motor direction %s\n", s_rel ? "learned" : "not learned yet — jog the flap with the motor");
+        printf("  'calibrate' walks through it. By hand: move the flap to one end, 'lim expanded';\n"
+               "  to the other, 'lim collapsed'. Both in one session, the encoder not zeroed in\n"
+               "  between, the motor jogged at least once. The range must fit in one turn.\n");
         return;
     }
-    printf("limits: expanded raw %lu | collapsed raw %lu | %.2f deg of travel = %ld steps (collapsed is %s of expanded) | play %ld%s\n",
-           (unsigned long)R.expanded_raw, (unsigned long)R.collapsed_raw,
-           deg(span_mag()), (long)R.span_steps,
-           R.span_steps > 0 ? "forward" : "backward", (long)R.backlash,
+    printf("limits: %.2f deg of travel, encoder %s, motor turns %s to collapse | play %ld%s\n",
+           deg(span_mag()), R.enc_dir > 0 ? "counts up" : "counts down",
+           R.mot_dir > 0 ? "forward" : "backward", (long)R.backlash,
            s_free ? " — NOT ENFORCED ('lim free')" : "");
     if (!encoder_available()) {
         printf("  no encoder — position in the range unknown\n");
         return;
     }
-    int64_t u = along(encoder_raw());
     printf("  ");
-    say_where(u);
-    if (s_synced && s_origin_gen == stepper_pos_gen()) {
-        int32_t p_step = axis_pos(), p_enc = to_steps(u);
-        printf("  step counter says %ld, encoder says %ld — %+.3f deg apart\n",
-               (long)p_step, (long)p_enc, steps_deg(p_step - p_enc));
-    } else {
-        printf("  step counter not seeded yet — it is on the next move, or 'lim sync'\n");
-    }
+    say_where(here());
     printf("  guard trips %.1f deg past either end\n", LIMIT_GUARD_DEG);
 }
 
-// ---- the guard ----------------------------------------------------------------
-// Encoder task, every sample. Only judges a motor that is moving under the
-// range: a shaft turned by hand while disabled is not the motor's doing, and a
-// move that started outside is on its way back in.
+// ---- the guard, the steering, the learning -----------------------------------
+// Encoder task, every sample. The guard only judges a motor that is moving
+// under the range: a shaft turned by hand while disabled is not the motor's
+// doing, and a move that started outside is on its way back in.
 void limits_guard(uint32_t raw)
 {
-    if (s_free || s_bypass || !calibrated() || !stepper_busy())
+    learn_direction();
+    if (!calibrated())
         return;
+
+    // A motor move that disagrees with the stored direction: trust the move.
+    // (Should only happen after the motor wiring is swapped.)
+    if (s_rel && R.mot_dir != s_rel * R.enc_dir) {
+        R.mot_dir = s_rel * R.enc_dir;
+        settings_mark_dirty();
+    }
+
     int64_t u = along(raw);
+    steer(u);
+    if (s_free || s_bypass || !stepper_busy())
+        return;
     if (u < -GUARD_COUNTS || u > (int64_t)span_mag() + GUARD_COUNTS) {
         stepper_stop_hard();
+        s_run     = false;
         s_trip_u  = u;
         s_tripped = true;
     }
@@ -1047,11 +886,20 @@ void limits_guard(uint32_t raw)
 
 void limits_poll_trip(void)
 {
+    uint8_t f = s_fault;
+    if (f) {
+        s_fault = FAULT_NONE;
+        if (f == FAULT_STALL)
+            printf("\n[lim] STALL: the flap stopped following the motor — hard stop. The creep\n"
+                   "  finishes slowly; check the driver's supply. 'lim' to see where it is.\n> ");
+        else
+            printf("\n[lim] WRONG WAY: the flap moved away from the target — hard stop.\n"
+                   "  Was the motor wiring changed? 'calibrate' again.\n> ");
+    }
     if (!s_tripped)
         return;
     s_tripped = false;
     int64_t u = s_trip_u;
-    printf("\nLIMIT GUARD: the shaft went %.2f deg %s — HARD STOP. The step counter is\n"
-           "  re-seeded from the encoder on the next move; 'lim' to see where it is.\n> ",
+    printf("\nLIMIT GUARD: the shaft went %.2f deg %s — HARD STOP. 'lim' to see where it is.\n> ",
            u < 0 ? -deg(u) : deg(u - span_mag()), u < 0 ? "past expanded" : "past collapsed");
 }

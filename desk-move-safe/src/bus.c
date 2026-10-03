@@ -174,6 +174,14 @@ bool desk_last_key(uint8_t *code, uint32_t *age_ms)
     return true;
 }
 
+uint32_t desk_still_ms(void)
+{
+    taskENTER_CRITICAL();
+    uint32_t at = s_dir_us;
+    taskEXIT_CRITICAL();
+    return (time_us_32() - at) / 1000u;
+}
+
 int8_t desk_direction(void)
 {
     taskENTER_CRITICAL();

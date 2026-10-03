@@ -36,7 +36,7 @@ directly, poke a register or change the flap's stored range. See
 | `dev start\|stop` | working | Unlock the dev commands, or lock them again. Dev mode suspends the flap intercept; leaving it stops and releases the motor. Never stored: every reboot comes up in working mode. |
 | `eeprom` | working | Every stored parameter with its value and unit, grouped by section. The first line says whether RAM matches flash, has a change waiting to be written, or nothing is stored yet. |
 | `eeprom <name>` | working | One parameter, e.g. `eeprom desk_flap_mm`. |
-| `eeprom set <name> <value>` | working | Change one parameter, in its stored unit (mm, not cm). Validated by the module that owns it; written to flash once the desk and the motor have been still for a few seconds. `lim_*`, `mot_*` and `desk_early_resume` need dev mode, and the measured ones are read-only — the reply names the command that sets them. |
+| `eeprom set <name> <value>` | working | Change one parameter, in its stored unit (mm, not cm). Validated by the module that owns it; written to flash once the desk and the motor have been still for a few seconds. `lim_*`, `mot_*` and `desk_resume_pct` need dev mode, and the measured ones are read-only — the reply names the command that sets them. |
 | `?` | working | The short command list. |
 | `go <cm>` | dev | Drive the desk to a height, bypassing the panel. Refused while the desk is locked (see [What it needs to move](#what-it-needs-to-move)). From far away it drives and releases a coast early; within a coast of the target, where a drive would overshoot, it steps up or down with 10 mm taps until it is within 10 mm. Panel buttons are ignored during the move; `stop` ends it. `go` does not move the flap: a target above the flap height is refused while the flap is not collapsed. |
 
@@ -69,7 +69,7 @@ Each line is `[dbg <seconds>] <what> <detail>`, printed when something
 | `height … mm (going up/down)` | the desk's height, from the board |
 | `board announces destination … mm` | where a recall is taking the desk — printed for every announcement, repeats included |
 | `flag hands-off / armed / desk locked / intercept = yes/no` | hands-off: the flap ignores the bus while a resumed move finishes; armed: bench builds only (`FLAP_DRIVES_MOTOR 0`) — with a motor, the desk is stopped whenever the flap is not at the end the far side needs; intercept: whether the flap may act at all |
-| `job …` | the flap job's phases: takeover (or `manual crossing` for a held key or a tap — no recall afterwards), at the flap height, flap moving to EXPANDED/COLLAPSED, flap there (or move FAILED — the desk stays put), resume (the recall re-sent once), whether it went out, done. With `desk_early_resume 1`, `resume` comes before `flap there` |
+| `job …` | the flap job's phases: takeover (or `manual crossing` for a held key or a tap — no recall afterwards), at the flap height, flap moving to EXPANDED/COLLAPSED, flap there (or move FAILED — the desk stays put), resume (the recall re-sent once), whether it went out, done. `flap fast part over at N%` marks the end of the fast part. With `desk_resume_pct` below 100, `resume` can come before it or before `flap there`. `the desk did NOT set off — … sending it again` means the board dropped the recall (see below) |
 | `… events LOST` | the console could not print fast enough; the record has a gap |
 
 **Reading a stand → sit move that stops at the flap.** The sequence should be:
@@ -91,19 +91,18 @@ going down again. The last line before it goes quiet says where it stopped:
 
 ## lim — the flap's travel range
 
-Stored as the MT6835's raw angle at each end plus the microsteps between them.
+Stored as the MT6835's raw angle at each end, plus two directions: which way
+round the flap travels, and which way the motor turns it. No step count.
 Until **both** ends are stored the motor only jogs **and the desk refuses every
 move** (see [What it needs to move](#what-it-needs-to-move)). `reset` clears
 them.
 
 | Command | Mode | What it does |
 |---|---|---|
-| `lim` | working | The stored range field by field, whether both ends are stored, where the shaft is in the range, how far the step counter and the encoder disagree. With nothing stored, it says how to store it. |
+| `lim` | working | The stored range field by field, whether both ends are stored, the directions, and where the shaft is in the range. With nothing stored, it says how to store it. |
 | `lim expanded` | dev | Store the shaft's current position as the flap's expanded end. |
-| `lim collapsed` | dev | Store it as its collapsed end. Must be in the same session as `lim expanded`, with no `mot zero`, `enc zero` or `mot halt` in between, so the steps between the ends are counted. The range must fit inside one turn of the magnet's shaft. With a range already stored, `lim expanded`/`lim collapsed` move that end to where the shaft is now (shrinking only; to widen, `lim free`, jog past, then mark). |
-| `lim play [<deg>]` | dev | Measure the gearbox backlash by creeping each way until the encoder sees the output move `<deg>` (default 1), and store it as `lim_backlash`. Must be done **before** storing the ends, since the span is corrected by it — on a calibrated flap, `reset` first. |
-| `lim span [<n>]` | dev | With no argument: after `mot go expanded` then `mot go collapsed`, re-measure the steps between the ends from the step counter. With a number: set it. |
-| `lim sync` | dev | Re-seed the step counter from the encoder's absolute angle and say where the shaft is. Happens automatically at boot and before every move. |
+| `lim collapsed` | dev | Store it as its collapsed end. Must be in the same session as `lim expanded`, with no `enc zero` in between, so the way round between the ends is known — and the motor must have jogged the flap at least once, so its direction is. The range must fit inside one turn of the magnet's shaft. With a range already stored, `lim expanded`/`lim collapsed` move that end to where the shaft is now. |
+| `lim play [<deg>]` | dev | Measure the gearbox backlash by creeping each way until the encoder sees the output move `<deg>` (default 1), and store it as `lim_backlash`. Any time; the calibration does not depend on it. |
 | `lim free` | dev | Toggle: ignore the range and the guard until reboot or `lim free` again. For measurements that need whole turns. Nothing then stops the flap hitting its ends. |
 
 ## mot — the flap motor
@@ -118,31 +117,40 @@ motor `LIMIT_GUARD_DEG` past either end if something does anyway.
 | `mot on\|off` | dev | Energise the coils, or release them so the flap turns by hand. |
 | `mot accel <sps2>` | dev | Ramp rate, microsteps per second squared. Session only. |
 | `mot jog <steps>` | dev | A small signed move, at most one motor revolution. The only move allowed with no range stored, for finding the ends. With a range stored it is range-checked, and from outside the range it may only head back in. |
-| `mot go expanded\|collapsed\|<n>` | dev | Go to the expanded or collapsed end, or `n` microsteps from expanded: fast most of the way, then slowly for the last `lim_approach_deg` degrees while the encoder is watched, stopping within 0.1° of the target (see [How mot go arrives](#how-mot-go-arrives)). Any key stops it. |
+| `mot go expanded\|collapsed\|<deg>` | dev | Go to the expanded or collapsed end (`expand` / `collapse` work too), or `deg` degrees from expanded — anything else is refused with the usage line: at speed, steered by the encoder, ramping down `lim_approach_deg` short, then crept onto the target to within 0.1° (see [How mot go arrives](#how-mot-go-arrives)). Any key stops it. |
 | `mot move <steps>` | dev | Signed relative move in microsteps, refused if it would end outside the range. |
 | `mot rev <revs>` | dev | Signed revolutions of the flap shaft, through `GEAR_RATIO`. Same range check. |
 | `mot run fwd\|back` | dev | With a range: run to the end of travel that way and settle. Under `lim free`: run until `mot stop`. |
 | `mot stop` | dev | Ramp down. |
-| `mot halt` | dev | Cut the pulses now. The step count no longer matches the shaft; the next move re-seeds it from the encoder. |
+| `mot halt` | dev | Cut the pulses now, no ramp. Nothing is lost: positions come from the encoder. |
 | `mot zero` | dev | Call this position zero (the step counter only; the stored range is in absolute angle and unaffected). |
 
 ### How mot go arrives
 
-A `mot go` cannot just run the counted number of steps and stop. Between motor
-and flap there is a gearbox with some play, and the flap has weight: near the
-point where its weight changes sides, it can drop through that play and land a
-few degrees **further than the motor moved**. Run the whole distance at speed
-and the flap overshoots — at an end, into the end stop.
+A `mot go` cannot just run a number of steps and stop. Between motor and flap
+there is a gearbox with some play, the flap has weight, and steps can be lost;
+a step count is only ever an estimate of where the flap is. **The encoder
+decides**, the whole way:
 
-So a move is done in two parts:
-
-1. **Fast, by step count**, to `lim_approach_deg` degrees *short* of the target.
+1. **Fast, steered by the encoder.** The motor runs towards the target. On
+   every encoder sample (every 2 ms) the firmware works out the distance still
+   to go and how far the motor needs to brake from its present speed, and
+   ramps it down when the two meet — so it stops `lim_approach_deg` *short* of
+   the target.
 2. **Creep**: a few microsteps at a time, reading the encoder after each, until
    the flap is within 0.1° (`LIMIT_SETTLE_DEG`) of the target.
 
-The flap therefore always arrives slowly, from the inside of its range, and the
-encoder decides when it is there. Example, 179.6° of travel, approach 4°:
-`mot go collapsed` runs the first 175.6° at speed and creeps the last 4°.
+The flap therefore always arrives slowly, from the inside of its range. The
+gear ratio only sizes the braking distance and the creep increments; if it is
+a little off, braking starts a little early or late and the creep absorbs it.
+
+While the fast part runs, the firmware also watches that the flap is
+following: no progress for 0.4 s is a **stall** (`[lim] STALL`), and moving
+away from the target is a **wrong way** (`[lim] WRONG WAY` — the motor's
+direction no longer matches the calibration). Both stop the motor at once.
+
+Example, 171.3° of travel, approach 4°: `mot go collapsed` runs about 167° at
+speed and creeps the last 4°.
 
 | lim_approach_deg | Effect |
 |---|---|
@@ -193,13 +201,12 @@ Two things, checked at every panel frame and before every motor move:
    | `lim_flags` | both bits set: both ends are stored |
    | `lim_expanded_raw` | the flap shaft's angle at its expanded end |
    | `lim_collapsed_raw` | its angle at its collapsed end |
-   | `lim_enc_span` | sensor counts from expanded to collapsed |
-   | `lim_span_steps` | motor microsteps from expanded to collapsed |
-   | `lim_steps_per_rev` | the microstepping `lim_span_steps` was counted in |
+   | `lim_enc_dir` | which way round the flap travels from expanded to collapsed |
+   | `lim_mot_dir` | which way the motor turns to collapse it |
 
    They are measured together — by `calibrate`, or `lim expanded` then `lim collapsed` in dev
    mode — and only make sense as a set. They are read-only through `eeprom`, and **`reset` clears exactly
-   these six** — nothing else.
+   these five** — nothing else.
 
 Every other parameter has a working value from the start and never blocks a
 move: the presets are learned, the coast and flap height come from
@@ -227,7 +234,7 @@ suggests it whenever the flap is not calibrated.
 
 ```text
 > calibrate
-flap calibration cleared — ...           # step 0: the six parameters above
+flap calibration cleared — ...           # step 0: the five parameters above
 CALIBRATE 1/2 — move the flap to its EXPANDED position with the motor:
 calibrate expanded> mot jog -400                   # signed microsteps, one motor turn max
 calibrate expanded>                                # Enter repeats the last jog
@@ -240,14 +247,14 @@ calibrate collapsed> done                           # lim_collapsed_raw stored, 
 CALIBRATION COMPLETE — the desk is unlocked.
 ```
 
-- **Only `lim_expanded_raw` and `lim_collapsed_raw` are positions you set.** The other
-  four — `lim_flags`, `lim_enc_span`, `lim_span_steps`, `lim_steps_per_rev` —
-  are worked out from the two marks: the sensor counts between the angles, and
-  the motor steps the jogs took to get from one to the other.
-- **Move the flap with the motor, not by hand.** The steps between the ends are
-  counted from the motor's own moves; a hand-turned end has none behind it, and
-  the span comes out wrong (`lim collapsed` warns when it disagrees with the gear
-  ratio by more than 20%).
+- **Only `lim_expanded_raw` and `lim_collapsed_raw` are positions.** The other
+  three are worked out on the way: `lim_flags` (both stored), `lim_enc_dir`
+  (which way round the flap went between the two marks) and `lim_mot_dir`
+  (which way the motor turned it, learned by watching the encoder during the
+  jogs). Nothing is counted, so nothing can be miscounted.
+- **The flap may be turned by hand** (`mot off` releases the coils), as long as
+  the motor jogs it at least once along the way, by more than half a degree —
+  that is how its direction is learned. Otherwise `calibrate` says so.
 - **Jogs are capped** at one motor revolution each, because there is no range
   yet to check a bigger move against. With the gearbox that is a small turn of
   the flap, so Enter-to-repeat does the travelling.
@@ -256,8 +263,7 @@ CALIBRATION COMPLETE — the desk is unlocked.
 - If the two marks do not make a usable range — the same place, or more than
   one turn of the shaft apart — `calibrate` says so and starts again from expanded.
 - `abort` leaves it with the calibration cleared and the desk locked.
-- Backlash: `lim play` measures it, and must run before the ends are stored —
-  `dev start`, `reset`, `lim play`, then `calibrate`.
+- Backlash: `lim play` measures it, before or after calibrating.
 
 The record is written to flash a couple of seconds after `done`, once the motor
 is still (`[settings] saved: ... limits stored`). `eeprom` shows what was stored.
@@ -268,7 +274,7 @@ What `eeprom` lists: one CRC-checked record in the last flash sector, owned by
 [`../src/settings.c`](../src/settings.c). Each name is `<section>_<field>`, and
 the section is the console group it belongs to (`mot_*` is the flap motor).
 **Needed** marks the calibration the desk and the motor cannot move without —
-the six `reset` clears. [Parameters explained](#parameters-explained) below says
+the five `reset` clears. [Parameters explained](#parameters-explained) below says
 what each one means in practice.
 
 | Parameter | Unit | Meaning | `eeprom set` | Needed |
@@ -280,14 +286,13 @@ what each one means in practice.
 | `desk_coast_down_mm` | mm | the same, going down | working | |
 | `desk_flap_mm` | mm | the height the desk is stopped at so the flap can move | working | |
 | `desk_flap_on` | 0\|1 | whether the desk is stopped there and the flap moved. With 0 the flap is never moved, and the crossing guard refuses any move up past the flap height while the flap is not collapsed | working | |
-| `desk_early_resume` | 0\|1 | when the desk moves on after the flap: 0 = once the flap has settled on its end, 1 = as soon as its fast move is over and it starts to creep | dev | |
+| `desk_resume_pct` | % | when the desk moves on after the flap: once the flap has covered this share of its move, by the encoder. 100 (default) = once it has settled on its end. On this desk below 100 gains at most ~0.5 s ([why](#when-the-desk-moves-on-desk_resume_pct)) | dev | |
 | `lim_flags` | bits | which ends are stored: 1 = expanded, 2 = collapsed, 3 = both | read-only: `lim expanded`, `lim collapsed` | **yes** — `reset` clears it |
 | `lim_expanded_raw` | raw | the encoder's reading with the flap at its expanded end | read-only: `lim expanded` | **yes** — `reset` clears it |
 | `lim_collapsed_raw` | raw | the encoder's reading with the flap at its collapsed end | read-only: `lim collapsed` | **yes** — `reset` clears it |
-| `lim_enc_span` | counts | encoder counts from expanded to collapsed, with direction | read-only: `lim collapsed` | **yes** — `reset` clears it |
-| `lim_span_steps` | microsteps | motor microsteps from expanded to collapsed, with direction | read-only: `lim collapsed`, `lim span` | **yes** — `reset` clears it |
-| `lim_steps_per_rev` | microsteps | microsteps per motor turn when the span was counted | read-only | **yes** — `reset` clears it |
-| `lim_backlash` | microsteps | the gearbox's play, added to every change of direction | dev, before the ends (`lim play` measures it) | |
+| `lim_enc_dir` | +1\|-1 | which way round the flap travels from expanded to collapsed: +1 the raw angle counts up | read-only: `calibrate` | **yes** — `reset` clears it |
+| `lim_mot_dir` | +1\|-1 | which way the motor turns to collapse the flap: +1 forward | read-only: `calibrate`, learned from the motor | **yes** — `reset` clears it |
+| `lim_backlash` | microsteps | the gearbox's play, added to open-loop moves that change direction | dev (`lim play` measures it) | |
 | `lim_approach_deg` | deg | how far before its target a `mot go` slows to a creep | dev | |
 | `mot_speed_sps` | steps/s | the flap motor's cruise speed, 100..15000 | dev | |
 | `mot_early_start` | 0\|1 | when the flap starts: 0 = once the desk has stopped at the flap height, 1 = the moment the desk is told to stop | dev | |
@@ -349,29 +354,29 @@ and the MT6835 reads its angle as a number from 0 to 2 097 151 for one full
 turn — 5 825 counts per degree. That number is absolute: it is the same after
 a power cut, which is why the ends are stored as angles.
 
-Your calibration of 2026-10-02, as an example:
+An example — this flap's calibration of 2026-10-02 (it has been redone since,
+and is now ~172.4° of travel):
 
 | Parameter | Value | Read as |
 |---|---|---|
 | `lim_expanded_raw` | 1 382 270 | the shaft at 237.28° when the flap is at its expanded end |
 | `lim_collapsed_raw` | 336 164 | at 57.71° when it is at its collapsed end |
-| `lim_enc_span` | −1 046 106 | expanded → collapsed is 179.6° of shaft, and the reading goes **down** on the way (the sign) |
-| `lim_span_steps` | −13 600 | the motor turned 13 600 microsteps to get there, in its **backward** direction (the sign) |
-| `lim_steps_per_rev` | 1 600 | counted at 8 microsteps × 200 steps per motor turn |
+| `lim_enc_dir` | −1 | from expanded to collapsed the reading goes **down**: 237.28° → 57.71° is 179.6° that way round (the other way round would be 180.4°) |
+| `lim_mot_dir` | −1 | the motor turns **backward** to collapse the flap |
 | `lim_flags` | 3 | both ends stored |
 
-- **Two measures of the same distance.** `lim_enc_span` is the distance as the
-  *encoder* sees it — the truth, read at any time. `lim_span_steps` is the same
-  distance as the *motor* moves it — exact as long as no step is lost. A move
-  is made of steps and checked against the angle; if the two disagree by more
-  than 1° (`LIMIT_RESYNC_DEG`), the step counter is re-seeded from the encoder.
-- **Cross-check.** 179.6° of flap at the 17.23:1 gearbox should take
-  179.6 / 360 × 17.23 × 1 600 ≈ 13 750 microsteps. 13 600 is 1.1% short —
-  normal for gearbox play while jogging. Over 20% off, `lim collapsed` warns: steps
-  were lost, or the flap was moved by hand.
-- **`lim_steps_per_rev`** exists so a change of microstepping does not break
-  the span: at boot, if the driver's microstepping differs, `lim_span_steps` is
-  scaled to match.
+- **The two angles are the only positions.** Everything else is a direction.
+  Two angles on a circle make two arcs; `lim_enc_dir` says which one is the
+  flap's travel, which matters when the range is near half a turn, as here.
+- **No step count is stored.** Moves are steered by the encoder (see
+  [How mot go arrives](#how-mot-go-arrives)), so a wrong count — lost steps
+  while calibrating, a changed microstepping, a gear ratio slightly off —
+  cannot make the flap fall short any more. Until 2026-10-03 the span was also
+  stored in motor steps, and a miscounted one made every move creep the last
+  quarter of its travel.
+- **`lim_mot_dir` corrects itself**: every motor move is watched, and if the
+  motor turns out to go the other way (the motor's wires swapped, say), the
+  stored direction is changed to match.
 - **The range must fit within one turn of the shaft**, since the encoder cannot
   tell one turn from the next.
 
@@ -386,15 +391,14 @@ motor:  ──────►  stop  ◄── 0 … backlash … ──◄◄�
                         (motor turns, flap does not)
 ```
 
-`lim_backlash` is that slack in microsteps. Every move that reverses direction
-is made that much longer, so the *flap* travels the distance asked for. 0 (the
-default) means none is compensated — moves after a reversal come up short by
-the slack, which the encoder then corrects on a `mot go`.
+`lim_backlash` is that slack in microsteps. Every **open-loop** move that
+reverses direction (`mot jog`, `mot move`, `mot rev`) is made that much longer,
+so the *flap* travels the distance asked for. `mot go` and the flap's own moves
+do not need it: they stop on the encoder. 0 (the default) compensates nothing.
 
 `lim play` measures it: it creeps one way, then the other, a few microsteps at
 a time with the coils released between steps, and notes when the encoder sees
-the flap start to move. It must be measured **before** the ends are stored,
-because the counted span depends on it: `reset`, `lim play`, then `calibrate`.
+the flap start to move. It can be measured at any time.
 
 ### Arriving without overshooting: `lim_approach_deg`
 
@@ -410,44 +414,10 @@ and slower; 0 = no creep, and the flap may overshoot first.
 How fast the flap motor turns once it has accelerated, in microsteps per
 second. With 1 600 microsteps per motor turn and the 17.23:1 gearbox, the
 default 5 000 is about 3.1 motor turns a second = **65° of flap per second**, so
-your 179.6° of travel takes about 3 s plus the ramp and the creep. The motor was
+a travel of ~172° (this flap, 2026-10-03) takes about 2.7 s plus the ramp and
+the creep — measured: the fast part done in ~2.6 s. The motor was
 measured stable to 15 000 without load; keep well under that with the flap on
 it. Acceleration (`mot accel`) is not stored.
-
-### When the flap starts: `mot_early_start`
-
-- **0 (default)** — the flap starts once the desk has stopped at the flap
-  height (the height unchanged for 1.2 s).
-- **1** — the flap starts the moment the desk is told to stop: at the release
-  point of the approach, or when the stop key goes out. The desk's coast and
-  the flap's travel overlap, which saves about a second per crossing.
-
-Either way (and unless `desk_early_resume` is set) the recall is only re-sent once the desk is still **and** the
-encoder confirms the flap is at its end. With 1, the flap motor runs while the
-desk's motors are still running, so the driver needs a supply that stays on
-while the desk moves — the controller board's power output does not (below).
-
-### When the desk moves on: `desk_early_resume`
-
-A flap move has a fast part and then a short creep onto its end
-([How mot go arrives](#how-mot-go-arrives)).
-
-- **0 (default)** — the recall is re-sent once the flap has **settled on its
-  end**, confirmed by the encoder to within 0.1°. If the flap does not get
-  there, the desk stays at the flap height.
-- **1** — the recall is re-sent as soon as the **fast part is over**, and the
-  creep finishes while the desk is already moving. It saves the creep time
-  (about a second) per crossing.
-
-With 1 the encoder is still asked first: the desk only goes on if the flap
-really is within `lim_approach_deg` + 2° of its end. If it is not — the motor
-stalled — the desk waits for the whole flap move, as with 0.
-
-The price of 1: **if the creep then fails, the desk cannot be held back** — it
-has already resumed, with the flap a few degrees short of its end. The console
-says `FLAP MOVE FAILED in the creep — the desk had ALREADY resumed` and the LED
-blinks red. And the creep runs while the desk's motors do, so, like
-`mot_early_start`, it needs the driver on a supply that stays on during a move.
 
 **A stall means a long creep.** If the motor cannot turn the flap during the
 fast part it skips steps: the flap barely moves, and the creep — a few
@@ -465,3 +435,64 @@ power mid-move, dropped out of step and could not recover at speed. Powered
 from a separate supply it runs at the default 5000 without trouble —
 [wiring.md](../../docs/wiring.md#power). If a stall shows up with a good supply, lower the speed
 (`eeprom set mot_speed_sps 2500`) or soften the ramp (`mot accel 10000`).
+
+### When the flap starts: `mot_early_start`
+
+- **0 (default)** — the flap starts once the desk has stopped at the flap
+  height (within 10 mm of it with the height unchanged for 0.4 s — the board ends a move up with a slow crawl — or unchanged for 1.2 s further off).
+- **1** — the flap starts the moment the desk is told to stop: at the release
+  point of the approach, or when the stop key goes out. The desk's coast and
+  the flap's travel overlap, which saves about a second per crossing.
+  Measured 2026-10-03 at `mot_speed_sps` 5000: by the time the desk has
+  stopped at the flap height, the flap is already **93–99%** of the way.
+
+Either way (and unless `desk_resume_pct` is below 100) the recall is only re-sent once the desk is still **and** the
+encoder confirms the flap is at its end. With 1, the flap motor runs while the
+desk's motors are still running, so the driver needs a supply that stays on
+while the desk moves — the controller board's power output does not (below).
+
+### When the desk moves on: `desk_resume_pct`
+
+The recall that sends the desk on to its preset is re-sent once the flap has
+covered **this share of its move**, measured by the encoder — from where the
+flap started to the end it is going to.
+
+- **100 (default)** — once the flap has **settled on its end**, confirmed by
+  the encoder to within 0.1°. If the flap does not get there, the desk stays at
+  the flap height.
+- **below 100** — as soon as the flap is that far along. The desk's ~1 s start-up
+  then overlaps the rest of the flap's travel. 80, say, sends the desk on with
+  the last fifth of the flap's move still to go.
+
+The share is checked throughout the fast part and once more at its end. The
+recall is only queued at that moment — the flap carries on at once, and the bus
+sends the recall on the panel's next poll.
+
+**The recall waits for a desk that has really stopped**: its height unchanged
+for 1.2 s. Going up, the board ends a move with a slow crawl, and a recall that
+arrives during it is announced and then **dropped** — the desk stays at the
+flap height (seen 2026-10-03). So the share may be reached first and the
+recall still wait a moment. And if, 4 s after the recall, the desk has not
+moved 5 mm towards its destination, the recall is sent once more
+(`[flap] the desk did not set off — the recall was dropped. Sending it again.`). The
+fast part stops `lim_approach_deg` short of the end (about 98% of a full
+travel), so a value above that is reached only by the creep — and then behaves
+like 100.
+
+The price of anything below 100: **if the flap then fails, the desk cannot be
+held back** — it has already resumed. The console says `FLAP MOVE FAILED — the
+desk had ALREADY resumed` and the LED blinks red. And the flap finishes while
+the desk's motors run, so the driver needs a supply that stays on during a
+move.
+
+**On this desk it makes almost no difference — leave it at 100.** The recall
+can never go before the desk has been still for 1.2 s (above), and with
+`mot_early_start 1` at the default 5000 steps/s the flap is already **93–99%**
+of the way by then (measured 2026-10-03, both directions). So any value below
+~93 triggers at that same moment, no earlier, and the most it saves is the end
+of the creep — 0.3–0.5 s, going down only. It would only matter with a much
+slower flap, or with `mot_early_start 0`. Its cost is real either way: a flap
+that fails after an early resume cannot hold the desk back.
+
+Replaced `desk_early_resume` (0|1: resume once the fast part was over) on
+2026-10-03; an older record gets 100.

@@ -37,12 +37,15 @@ typedef struct {
 } settings_desk_t;
 
 typedef struct {
-    // The bench rig's limits.c record, field for field. All zero until
-    // 'lim min' and 'lim max' are stored.
+    // The flap's calibration. All zero until both ends are stored. Only the
+    // two raw angles are positions; the rest are two signs. Version 5: same
+    // size and offsets as before, enc_dir/mot_dir/reserved taking the places
+    // of enc_span/span_steps/steps_per_rev, whose signs they inherit.
     uint32_t flags;
     uint32_t expanded_raw, collapsed_raw;
-    int32_t  enc_span, span_steps;
-    uint32_t steps_per_rev;
+    int32_t  enc_dir;           // +1: the raw angle counts up expanded -> collapsed
+    int32_t  mot_dir;           // +1: positive motor steps collapse the flap
+    uint32_t reserved;
     int32_t  backlash;
     float    approach_deg;
 } settings_lim_t;
@@ -60,8 +63,9 @@ typedef struct {
     settings_lim_t   lim;
     settings_mot_t   mot;       // version 2. New fields go at the END, so
                                 // an older record is this one, truncated.
-    uint32_t         desk_early_resume; // version 4. A desk_* value, but here:
-                                        // the desk section cannot grow in place.
+    uint32_t         desk_resume_pct;   // version 6 (was desk_early_resume, 0|1,
+                                        // from version 4). A desk_* value, but
+                                        // here: the desk section cannot grow.
 } settings_t;
 
 settings_t *settings(void);     // owners read and write their own section

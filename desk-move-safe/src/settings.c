@@ -16,15 +16,19 @@
 
 // Bump on any layout change: nvs rejects a record of the wrong length, so an
 // older one reads as "nothing stored" rather than as garbage.
-#define SETTINGS_VERSION    4
+#define SETTINGS_VERSION    6
 
 // Older layouts are this one, truncated: version 1 ended before `mot`, version
-// 2 before mot.early_start, version 3 before desk_early_resume. Read as such, a record keeps its values and the new
+// 2 before mot.early_start, version 3 before desk_early_resume. Version 4 had
+// this layout exactly, but stored the flap's span (enc_span, span_steps) where
+// version 5 keeps only its directions — upgraded by taking their signs.
+// Version 5 kept desk_early_resume (0|1) where version 6 keeps
+// desk_resume_pct — every older record gets the default, 100. Read as such, a record keeps its values and the new
 // fields take their defaults — a firmware update must not throw away the flap
 // calibration, which would lock the desk until 'calibrate' is run again.
 #define SETTINGS_V1_SIZE    offsetof(settings_t, mot)
 #define SETTINGS_V2_SIZE    offsetof(settings_t, mot.early_start)
-#define SETTINGS_V3_SIZE    offsetof(settings_t, desk_early_resume)
+#define SETTINGS_V3_SIZE    offsetof(settings_t, desk_resume_pct)
 
 static settings_t          s_live;
 static volatile bool       s_dirty;
@@ -44,7 +48,7 @@ static void gather(void)
     s_live.desk.flap_on = flap_enabled() ? 1 : 0;
     s_live.mot.speed_sps   = stepper_speed();
     s_live.mot.early_start = flap_early_start() ? 1 : 0;
-    s_live.desk_early_resume = flap_early_resume() ? 1 : 0;
+    s_live.desk_resume_pct = flap_resume_pct();
 }
 
 static void apply(void)
@@ -56,7 +60,8 @@ static void apply(void)
     flap_set_enabled(s_live.desk.flap_on != 0);
     if (s_live.mot.speed_sps) stepper_set_speed(s_live.mot.speed_sps);
     flap_set_early_start(s_live.mot.early_start != 0);
-    flap_set_early_resume(s_live.desk_early_resume != 0);
+    flap_set_resume_pct(s_live.desk_resume_pct >= 1 && s_live.desk_resume_pct <= 100
+                        ? (uint8_t)s_live.desk_resume_pct : 100);
 }
 
 void settings_load(void)
@@ -72,13 +77,22 @@ void settings_load(void)
         return;
     }
     size_t old = 0;
-    if (nvs_read(&s, SETTINGS_V3_SIZE) && s.version == 3)      old = SETTINGS_V3_SIZE;
+    if (nvs_read(&s, sizeof s) && (s.version == 4 || s.version == 5)) old = sizeof s;
+    else if (nvs_read(&s, SETTINGS_V3_SIZE) && s.version == 3) old = SETTINGS_V3_SIZE;
     else if (nvs_read(&s, SETTINGS_V2_SIZE) && s.version == 2) old = SETTINGS_V2_SIZE;
     else if (nvs_read(&s, SETTINGS_V1_SIZE) && s.version == 1) old = SETTINGS_V1_SIZE;
     if (old) {
         memcpy(&s_live, &s, old);               // the rest stays zero: defaults
         if (old < SETTINGS_V3_SIZE)
             s_live.mot.early_start = FLAP_START_WITH_STOP;
+        // Versions 1-4 stored the span; only its direction is still needed.
+        // The step count's sign was the motor's direction to collapse, the
+        // encoder span's sign the way round — the calibration carries over.
+        int32_t es = s_live.lim.enc_dir, ss = s_live.lim.mot_dir;
+        s_live.lim.enc_dir  = es > 0 ? 1 : es < 0 ? -1 : 0;
+        s_live.lim.mot_dir  = ss > 0 ? 1 : ss < 0 ? -1 : 0;
+        s_live.lim.reserved = 0;
+        s_live.desk_resume_pct = 100;
         s_live.version = SETTINGS_VERSION;
         s_stored = true;
         apply();

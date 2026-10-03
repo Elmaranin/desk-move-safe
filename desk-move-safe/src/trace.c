@@ -117,6 +117,8 @@ static void print(const ev_t *e)
                                                          : "recall NEVER went out (panel quiet)"); break;
         case TRJ_ABORTED:    printf("job    aborted ('stop')\n"); break;
         case TRJ_DONE:       printf("job    done — bus handed back to the panel\n"); break;
+        case TRJ_FAST_END:   printf("job    flap fast part over at %ld%% of its move — creep next\n", (long)e->b); break;
+        case TRJ_RETRY:      printf("job    the desk did NOT set off — recall dropped, sending it again\n"); break;
         case TRJ_SWAP:       printf("job    manual crossing — flap to %s, no recall\n",
                                     e->b ? "COLLAPSED" : "EXPANDED"); break;
         default:             printf("job    phase %ld\n", (long)e->a); break;

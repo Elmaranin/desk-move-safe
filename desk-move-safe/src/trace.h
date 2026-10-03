@@ -61,6 +61,8 @@ enum {
     TRJ_ABORTED,
     TRJ_DONE,
     TRJ_SWAP,       // a manual crossing: b = 1 collapsing, 0 expanding
+    TRJ_FAST_END,   // the flap's fast part is over: b = % of its move done
+    TRJ_RETRY,      // the desk did not set off after the recall: sent again
 };
 
 void trace_set(bool on);

@@ -30,6 +30,9 @@ bool desk_last_key(uint8_t *code, uint32_t *age_ms);
 // blind for the whole of an autonomous move.
 int8_t desk_direction(void);
 
+// How long the height has been unchanged, in ms.
+uint32_t desk_still_ms(void);
+
 // The height the board announced before an autonomous move — a preset's
 // destination, about a second before the desk starts. It arrives as a height
 // frame that jumps too far to be real, which is also how it is recognised.

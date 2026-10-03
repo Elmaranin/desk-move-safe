@@ -68,15 +68,13 @@ static void help(void)
         "  lim expanded        store where the flap is now as its EXPANDED end\n"
         "  lim collapsed       store it as its COLLAPSED end (same session)\n"
         "  lim play [<deg>]    measure the gearbox backlash (before the ends)\n"
-        "  lim span [<n>]      re-measure the steps between the ends, or set them\n"
-        "  lim sync            re-seed the step counter from the encoder\n"
         "  lim free            toggle: ignore the range until reboot — careful\n"
         "\n"
         "  mot                 the flap motor: what it is doing and how it is set\n"
         "  mot on|off          energise the coils, or release them\n"
         "  mot accel <sps2>    ramp rate, microsteps/s^2\n"
         "  mot jog <steps>     small move, max one motor turn — works with no range\n"
-        "  mot go expanded|collapsed|<n>   to an end, or n steps from expanded\n"
+        "  mot go expanded|collapsed|<deg>   to an end, or deg from expanded\n"
         "  mot move <steps>    signed microsteps, inside the range\n"
         "  mot rev <revs>      signed revolutions OF THE FLAP SHAFT (%g:1 box)\n"
         "  mot run fwd|back    to the end of travel that way\n"
@@ -494,12 +492,16 @@ static void mot(char *arg)
 
     } else if (!strcmp(arg, "go")) {
         bool ok;
-        if (v && !strcmp(v, "expanded"))      ok = limits_goto_end(false);
-        else if (v && !strcmp(v, "collapsed")) ok = limits_goto_end(true);
-        else if (v)                      ok = limits_goto((int32_t)strtol(v, NULL, 10));
+        // Strict: anything that is neither an end nor a whole number is a
+        // usage error. strtod() alone read "collapse" as 0 — the EXPANDED end.
+        char  *end = NULL;
+        double d   = v ? strtod(v, &end) : 0.0;
+        if (v && (!strcmp(v, "expanded") || !strcmp(v, "expand")))        ok = limits_goto_end(false);
+        else if (v && (!strcmp(v, "collapsed") || !strcmp(v, "collapse"))) ok = limits_goto_end(true);
+        else if (v && end != v && *end == '\0')                           ok = limits_goto_deg(d);
         else {
-            printf("usage: mot go expanded | mot go collapsed | mot go <steps from expanded, 0..%ld>\n",
-                   (long)limits_span_steps());
+            printf("usage: mot go expanded | mot go collapsed | mot go <deg from expanded, 0..%.1f>\n",
+                   limits_range_deg());
             return;
         }
         if (ok)
@@ -739,15 +741,16 @@ static void tmc(char *arg)
 // Always available, working mode included: a board without its calibration
 // has a locked desk, and whoever is in front of it must be able to fix that
 // without knowing about dev mode. It clears the calibration at once (what
-// 'reset' clears), then asks for the flap at min, then at max, and stores each
-// on 'done'. Everything else the range needs — the span in sensor counts and
-// in motor steps — limits.c works out from those two marks.
+// 'reset' clears), then asks for the flap at its expanded end, then at its
+// collapsed end, and stores each encoder angle on 'done'. The only other
+// things the range needs are two directions — which way round the flap went,
+// and which way the motor turns it — and limits.c learns both on the way.
 //
 // While it runs, 'mot' and 'enc' are unlocked so the flap can be positioned.
 // 'mot jog' moves it, one motor turn at most per command since there is no
 // range yet to check a bigger move against, and an empty line repeats the last
-// jog. Turning the flap by hand does NOT work: the steps between the ends are
-// counted from the motor's own moves, and a hand-turned end has none.
+// jog. The flap may also be turned by hand (coils off: 'mot off'), as long as
+// the motor jogs it at least once along the way, so its direction is known.
 
 typedef enum { CAL_OFF, CAL_EXPANDED, CAL_COLLAPSED } cal_t;
 static cal_t s_cal;
@@ -815,8 +818,8 @@ static void cal_done(void)
     printf("\nCALIBRATION COMPLETE — the desk is unlocked. Stored:\n");
     params_print("lim_expanded_raw");
     params_print("lim_collapsed_raw");
-    params_print("lim_enc_span");
-    params_print("lim_span_steps");
+    params_print("lim_enc_dir");
+    params_print("lim_mot_dir");
     printf("written to flash in a couple of seconds.\n");
 }
 
@@ -862,15 +865,11 @@ static void lim(char *arg)
 
     if (!strcmp(arg, "expanded"))        limits_mark(false);
     else if (!strcmp(arg, "collapsed"))   limits_mark(true);
-    else if (!strcmp(arg, "sync"))  limits_sync(true);
     else if (!strcmp(arg, "free"))  limits_set_free(limits_mode() != LIM_FREE);
-    else if (!strcmp(arg, "span")) {
-        if (!v) limits_store_span();
-        else    limits_set_span((int32_t)strtol(v, NULL, 10));
-    } else if (!strcmp(arg, "play")) {
+    else if (!strcmp(arg, "play")) {
         limits_measure_play(v ? strtod(v, NULL) : 1.0);
     } else {
-        printf("usage: lim [expanded | collapsed | play [deg] | span [n] | sync | free]\n");
+        printf("usage: lim [expanded | collapsed | play [deg] | free]\n");
     }
 }
 

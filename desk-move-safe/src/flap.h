@@ -66,11 +66,11 @@ bool flap_go(uint16_t mm);
 void flap_set_early_start(bool on);
 bool flap_early_start(void);
 
-// desk_early_resume: re-send the recall once the flap's fast part is over and
-// the encoder puts it within reach of its end (true), or only once the flap
-// has settled on its end (false). Stored.
-void flap_set_early_resume(bool on);
-bool flap_early_resume(void);
+// desk_resume_pct: re-send the recall once the flap has covered this share of
+// its move, by the encoder (1..100; 100 = once it has settled on its end).
+// Stored.
+void    flap_set_resume_pct(uint8_t pct);
+uint8_t flap_resume_pct(void);
 
 const char *flap_state_str(void);
 bool        flap_busy(void);

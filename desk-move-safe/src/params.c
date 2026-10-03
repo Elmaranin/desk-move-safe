@@ -33,9 +33,8 @@ static double get_version(void)   { return settings()->version; }
 static double get_flags(void)     { return settings()->lim.flags; }
 static double get_expanded_raw(void)   { return settings()->lim.expanded_raw; }
 static double get_collapsed_raw(void)   { return settings()->lim.collapsed_raw; }
-static double get_enc_span(void)  { return settings()->lim.enc_span; }
-static double get_span(void)      { return settings()->lim.span_steps; }
-static double get_spr(void)       { return settings()->lim.steps_per_rev; }
+static double get_enc_dir(void)   { return settings()->lim.enc_dir; }
+static double get_mot_dir(void)   { return settings()->lim.mot_dir; }
 static double get_backlash(void)  { return settings()->lim.backlash; }
 static double get_approach(void)  { return settings()->lim.approach_deg; }
 
@@ -114,11 +113,15 @@ static bool set_early(double v)
     return true;
 }
 
-static double get_resume(void) { return flap_early_resume() ? 1 : 0; }
+static double get_resume(void) { return flap_resume_pct(); }
 static bool set_resume(double v)
 {
-    if (v != 0 && v != 1) { printf("rejected: 0 or 1\n"); return false; }
-    flap_set_early_resume(v != 0);
+    if (v < 1 || v > 100) {
+        printf("rejected: 1..100 — the share of the flap's move, by the encoder, after\n"
+               "which the desk goes on. 100: once the flap has settled on its end.\n");
+        return false;
+    }
+    flap_set_resume_pct((uint8_t)v);
     settings_mark_dirty();
     return true;
 }
@@ -148,14 +151,13 @@ static const param_t P[] = {
     { "desk_coast_down_mm", "mm",        0, false, get_coast_dn, set_coast_dn, NULL },
     { "desk_flap_mm",       "mm",        0, false, get_flap_mm,  set_flap_mm,  NULL },
     { "desk_flap_on",       "0|1",       0, false, get_flap_on,  set_flap_on,  NULL },
-    { "desk_early_resume",  "0|1",       0, true,  get_resume,   set_resume,   NULL },
+    { "desk_resume_pct",    "%",         0, true,  get_resume,   set_resume,   NULL },
 
     { "lim_flags",          "bits",      0, true,  get_flags,    NULL,         "'lim expanded', 'lim collapsed', 'reset'" },
     { "lim_expanded_raw",        "raw",       0, true,  get_expanded_raw,  NULL,         "'lim expanded'; 'reset' clears it" },
     { "lim_collapsed_raw",        "raw",       0, true,  get_collapsed_raw,  NULL,         "'lim collapsed'; 'reset' clears it" },
-    { "lim_enc_span",       "counts",    0, true,  get_enc_span, NULL,         "'lim collapsed'; 'reset' clears it" },
-    { "lim_span_steps",     "microsteps",0, true,  get_span,     NULL,         "'lim collapsed', 'lim span'; 'reset' clears it" },
-    { "lim_steps_per_rev",  "microsteps",0, true,  get_spr,      NULL,         "the firmware, when the range is stored" },
+    { "lim_enc_dir",        "+1|-1",     0, true,  get_enc_dir,  NULL,         "'calibrate'; 'reset' clears it" },
+    { "lim_mot_dir",        "+1|-1",     0, true,  get_mot_dir,  NULL,         "'calibrate' (learned from the motor); 'reset' clears it" },
     { "lim_backlash",       "microsteps",0, true,  get_backlash, set_backlash, NULL },
     { "lim_approach_deg",   "deg",       1, true,  get_approach, set_approach, NULL },
 
